@@ -888,6 +888,23 @@ class LangGraphRecorder:
                 if update.get("mcp_transport"):
                     out2["mcp_transport"] = str(update.get("mcp_transport"))
                 return out2
+            # Additionally inspect nested metadata produced by messages stream
+            meta = update.get("metadata")
+            if isinstance(meta, dict):
+                name2 = meta.get("tool_name") or meta.get("name")
+                kind2 = meta.get("tool_kind")
+                if name2 and (
+                    kind2 == "MCP" or meta.get("mcp_server") or meta.get("mcp_transport")
+                ):
+                    out3: dict[str, str] = {
+                        "tool_kind": str(kind2 or "MCP"),
+                        "tool_name": str(name2),
+                    }
+                    if meta.get("mcp_server"):
+                        out3["mcp_server"] = str(meta.get("mcp_server"))
+                    if meta.get("mcp_transport"):
+                        out3["mcp_transport"] = str(meta.get("mcp_transport"))
+                    return out3
         return None
 
     def _extract_values(self, snapshot_or_obj: Any) -> dict[str, Any] | None:
