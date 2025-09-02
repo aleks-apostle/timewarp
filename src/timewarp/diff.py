@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+import difflib
+from dataclasses import dataclass
+from typing import Any
+from uuid import UUID
+
+from deepdiff import DeepDiff
+
+from .codec import from_bytes
+from .events import Event
+from .store import LocalStore
+
+
+@dataclass
+class Divergence:
+    step_a: int
+    step_b: int
+    reason: str
+    diff_text: str | None = None
+    diff_struct: dict[str, Any] | None = None
+
+
+def make_anchor_key(ev: Event) -> tuple[Any, Any] | tuple[Any, Any, Any, Any, Any | None]:
+    """Compute a comparable anchor key for an event.
+
+    Prefers explicit `anchor_id` label when present; otherwise falls back to a
+    tuple of (action_type, actor, namespace, thread_id, prompt_hash?)
+    """
+    # Prefer explicit anchor_id when present for robust alignment
+    if ev.labels and "anchor_id" in ev.labels:
+        return ("ANCHOR", ev.labels["anchor_id"])  # compact comparable form
+    # Fallback: include action type and actor, plus helpful labels and optional prompt hash
+    ns = ev.labels.get("namespace") if ev.labels else None
+    tid = ev.labels.get("thread_id") if ev.labels else None
+    p_hash = None
+    try:
+        p_hash = ev.hashes.get("prompt") if ev.hashes else None
+    except Exception:
+        p_hash = None
+    return (ev.action_type, ev.actor, ns, tid, p_hash)
+
+
+def realign_by_anchor(
+    evs_a: list[Event], evs_b: list[Event], *, start_a: int, start_b: int, window: int
+) -> tuple[int | None, int | None]:
+    """Search forward within a window to find matching anchors.
+
+    Returns (match_i, match_j) where match_i is the index in A that matches
+    B[start_b]'s anchor, and match_j is the index in B that matches A[start_a]'s
+    anchor. Either may be None if not found within the window.
+    """
+    i = start_a
+    j = start_b
+    n_a = len(evs_a)
+    n_b = len(evs_b)
+    ak_a = make_anchor_key(evs_a[i]) if i < n_a else None
+    ak_b = make_anchor_key(evs_b[j]) if j < n_b else None
+    match_i: int | None = None
+    match_j: int | None = None
+    if ak_b is not None:
+        for di in range(1, min(window, n_a - i)):
+            if make_anchor_key(evs_a[i + di]) == ak_b:
+                match_i = i + di
+                break
+    if ak_a is not None:
+        for dj in range(1, min(window, n_b - j)):
+            if make_anchor_key(evs_b[j + dj]) == ak_a:
+                match_j = j + dj
+                break
+    return (match_i, match_j)
+
+
+def first_divergence(
+    store: LocalStore, run_a: UUID, run_b: UUID, *, window: int = 5
+) -> Divergence | None:
+    evs_a = store.list_events(run_a)
+    evs_b = store.list_events(run_b)
+
+    # Early schema/adaptor checks
+    if evs_a and evs_b and evs_a[0].schema_version != evs_b[0].schema_version:
+        reason = f"schema_version mismatch: A={evs_a[0].schema_version} B={evs_b[0].schema_version}"
+        return Divergence(evs_a[0].step, evs_b[0].step, reason=reason)
+
+    def first_adapter_version(evs: list[Event]) -> str | None:
+        for e in evs:
+            mm = e.model_meta or {}
+            v = mm.get("adapter_version") if isinstance(mm, dict) else None
+            if isinstance(v, str):
+                return v
+        return None
+
+    av_a = first_adapter_version(evs_a)
+    av_b = first_adapter_version(evs_b)
+    if av_a and av_b and av_a != av_b:
+        return Divergence(0, 0, reason=f"adapter_version mismatch: A={av_a} B={av_b}")
+
+    def out_hash(ev: Event) -> str | None:
+        if ev.hashes and "output" in ev.hashes:
+            return ev.hashes["output"]
+        if ev.hashes and "state" in ev.hashes:
+            return ev.hashes["state"]
+        return None
+
+    # Two-pointer walk with small-window anchor realignment
+    i = 0
+    j = 0
+    n_a = len(evs_a)
+    n_b = len(evs_b)
+    WINDOW = max(1, int(window))
+
+    while i < n_a and j < n_b:
+        a = evs_a[i]
+        b = evs_b[j]
+        if make_anchor_key(a) != make_anchor_key(b):
+            # Try to realign within a small lookahead window
+            match_i, match_j = realign_by_anchor(evs_a, evs_b, start_a=i, start_b=j, window=WINDOW)
+            if match_i is not None or match_j is not None:
+                # Skip over the shorter gap to re-align; treat as benign reordering
+                if match_i is not None and (match_j is None or match_i - i <= match_j - j):
+                    i = match_i
+                else:
+                    j = match_j if match_j is not None else j
+                continue
+            # No anchor alignment within window: actor/type mismatch is a real divergence
+            return Divergence(a.step, b.step, reason="action_type/actor mismatch (unanchored)")
+
+        # Anchors aligned; compare hashes
+        if out_hash(a) != out_hash(b):
+            # Drill into structural/text diffs if possible
+            text = None
+            struct = None
+            try:
+                pa = _load_output(store, a)
+                pb = _load_output(store, b)
+                if isinstance(pa, dict | list) and isinstance(pb, dict | list):
+                    dd = DeepDiff(pa, pb, ignore_order=False)
+                    struct = dict(dd)
+                else:
+                    ta = _to_text(pa)
+                    tb = _to_text(pb)
+                    text = "\n".join(
+                        difflib.unified_diff(ta.splitlines(), tb.splitlines(), lineterm="")
+                    )
+            except Exception:
+                pass
+            return Divergence(
+                a.step, b.step, reason="output hash mismatch", diff_text=text, diff_struct=struct
+            )
+        i += 1
+        j += 1
+
+    if len(evs_a) != len(evs_b):
+        # One run has extra trailing events
+        longer, which = (evs_a, "A") if len(evs_a) > len(evs_b) else (evs_b, "B")
+        last_idx = min(len(evs_a), len(evs_b))
+        last = longer[last_idx]
+        return Divergence(last.step, last.step, reason=f"length mismatch: {which} longer")
+
+    return None
+
+
+def _load_output(store: LocalStore, ev: Event) -> Any:
+    if ev.output_ref:
+        data = store.get_blob(ev.output_ref)
+        return from_bytes(data)
+    return None
+
+
+def _to_text(obj: Any) -> str:
+    if obj is None:
+        return ""
+    if isinstance(obj, dict | list):
+        from .codec import to_bytes
+
+        return to_bytes(obj).decode("utf-8")
+    return str(obj)
