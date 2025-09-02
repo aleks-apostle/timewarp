@@ -170,6 +170,35 @@ Examples
 - Freeze-time example: `examples/langgraph_demo/time_freeze_app.py` provides `make_graph_time()` that writes `timewarp.determinism.now()` into state so you can verify identical timestamps on replay with `--freeze-time`.
 - Tests exercise recorder, diff alignment, replay state reconstruction, and playback installers.
 
+MCP Example (optional)
+----------------------
+
+When `langgraph` and `langchain-mcp-adapters` are available, you can run the MCP demo app:
+
+```
+# Record a run using the MCP example app
+python - <<'PY'
+from pathlib import Path
+from timewarp.store import LocalStore
+from timewarp.events import Run
+from timewarp.adapters.langgraph import LangGraphRecorder
+from examples.langgraph_demo.mcp_app import make_graph_mcp
+
+store = LocalStore(db_path=Path('./timewarp.db'), blobs_root=Path('./blobs'))
+graph = make_graph_mcp()
+run = Run(project='demo', name='mcp', framework='langgraph')
+rec = LangGraphRecorder(graph=graph, store=store, run=run, stream_modes=("messages","updates"), stream_subgraphs=True)
+_ = rec.invoke({"text":"hi"}, config={"configurable": {"thread_id": "t-1"}})
+print('run_id=', run.run_id)
+PY
+
+# View TOOL events with MCP metadata
+timewarp ./timewarp.db ./blobs events <run_id> --type TOOL --tool-kind MCP --json
+```
+
+Note: MCP metadata is best-effort and dependent on adapter/provider behavior. In environments
+where the stream does not emit tool metadata, you may not observe TOOL events for MCP calls.
+
 Time Provider & Freeze-Time
 ---------------------------
 
@@ -197,4 +226,3 @@ timewarp ./timewarp.db ./blobs inject <run_id> <step> --output alt.json \
 
 Example graph writes the ISO timestamp to state (key `now_iso`). With `--freeze-time`,
 replay preserves the exact value that was recorded.
-
