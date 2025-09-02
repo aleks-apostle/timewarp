@@ -1,0 +1,54 @@
+.cursor
+.claude
+.vscode
+.DS_Store
+.venv
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.development
+.env.test
+.env.production
+.mypy_cache
+.pytest_cache
+.ruff_cache
+CLAUDE.md
+AGENTS.md
+create_zip_file.py
+docs/
+
+# Project folders to ignore
+SPRINTS/
+.docs/
+
+# Python bytecode and caches
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and coverage artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Tools and editors
+.idea/
+.vscode/
+.cursor/
+.claude/
+.ipynb_checkpoints/
+.python-version
+
+# Logs
+*.log
