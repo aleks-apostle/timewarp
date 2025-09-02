@@ -9,7 +9,14 @@ from .diff import make_anchor_key, realign_by_anchor
 from .events import ActionType, BlobKind, BlobRef, Event, Run
 from .langgraph import RecorderHandle, wrap
 from .pruners import messages_pruner
-from .replay import AdapterInvariant, MissingBlob, Replay, ReplayError, SchemaMismatch
+from .replay import (
+    AdapterInvariant,
+    MissingBlob,
+    Replay,
+    ReplayError,
+    ReplaySession,
+    SchemaMismatch,
+)
 
 __all__ = [
     "ActionType",
@@ -21,6 +28,7 @@ __all__ = [
     "RecorderHandle",
     "Replay",
     "ReplayError",
+    "ReplaySession",
     "Run",
     "SchemaMismatch",
     "SystemTimeProvider",

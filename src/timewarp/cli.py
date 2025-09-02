@@ -107,6 +107,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Exit with non-zero status when a divergence is found",
     )
 
+    # export subcommands
+    exp = sub.add_parser("export")
+    exp_sub = exp.add_subparsers(dest="exporter", required=True)
+    exp_ls = exp_sub.add_parser("langsmith")
+    exp_ls.add_argument("run_id", help="Run ID to export")
+    exp_ls.add_argument(
+        "--include-blobs",
+        dest="include_blobs",
+        action="store_true",
+        help="Inline small blobs as JSON where possible",
+    )
+
     args = p.parse_args(argv)
     store = LocalStore(db_path=Path(args.db), blobs_root=Path(args.blobs))
 
@@ -318,6 +330,30 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
         return 0
+
+    if args.cmd == "export":
+        if args.exporter == "langsmith":
+            try:
+                from uuid import UUID as _UUID
+
+                import orjson as _orjson
+
+                from timewarp.exporters.langsmith import serialize_run as _serialize_run
+            except Exception as exc:  # pragma: no cover - dependency/import errors
+                print("Export failed: missing dependencies:", exc)
+                return 1
+            payload = _serialize_run(
+                store, _UUID(args.run_id), include_blobs=bool(getattr(args, "include_blobs", False))
+            )
+            try:
+                print(_orjson.dumps(payload).decode("utf-8"))
+            except Exception:
+                import json as _json
+
+                print(_json.dumps(payload, ensure_ascii=False))
+            return 0
+        print("Unknown exporter:", args.exporter)
+        return 1
 
     if args.cmd == "resume":
         # Lazy import to avoid optional deps at CLI parse time
@@ -641,8 +677,8 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if line.startswith("inject "):
                 try:
-                    _, s, payload = line.split(maxsplit=2)
-                    rep.inject(int(s), __import__("json").loads(payload))
+                    _, s, payload_text = line.split(maxsplit=2)
+                    rep.inject(int(s), __import__("json").loads(payload_text))
                     print("Injected at step", s)
                 except Exception as e:  # pragma: no cover
                     print("Inject failed:", e)

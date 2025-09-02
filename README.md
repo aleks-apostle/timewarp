@@ -15,6 +15,7 @@ What’s Included (v0.1 core)
 - Local store
   - `timewarp.store.LocalStore`: SQLite (WAL) for runs/events + filesystem blobs
   - Deterministic blob layout: `runs/<run_id>/events/<step>/<kind>.bin` (zstd)
+  - Connection PRAGMAs applied per-connection: `journal_mode=WAL`, `synchronous=NORMAL`, configurable busy timeout
 - LangGraph recording adapter
   - `timewarp.adapters.langgraph.LangGraphRecorder`: streams `updates|values|messages`, records `LLM|TOOL|DECISION|HITL|SNAPSHOT` events
   - Labels include `thread_id`, `namespace`, `node`, `checkpoint_id`, `anchor_id`
@@ -27,6 +28,7 @@ What’s Included (v0.1 core)
   - What‑if overrides supported (one‑shot per step)
 - CLI
   - `timewarp list|debug|diff`, plus `resume` and `inject` commands (see below)
+  - `export langsmith <run_id>` to serialize runs/events for external tooling
 - Telemetry (optional)
   - OpenTelemetry spans per event; replay spans link to originals via Span Links
   - Attributes use `tw.*` keys: `tw.run_id`, `tw.step`, `tw.action_type`, `tw.actor`, `tw.replay`,
@@ -69,6 +71,7 @@ rec = wrap(
     snapshot_on=("terminal", "decision"),
     state_pruner=messages_pruner(max_len=2000, max_items=200),
     enable_record_taps=True,  # robust prompt/tool args hashing
+    event_batch_size=20,      # batch appends to reduce SQLite overhead
 )
 result = rec.invoke({"text": "hi"}, config={"configurable": {"thread_id": "t-1"}})
 print("run_id=", rec.last_run_id)
@@ -139,6 +142,7 @@ Notes
  - REPL filters: inside `debug`, run `list type=LLM node=compose thread=t-1` to view a subset.
  - Pretty state: `state --pretty` prints truncated previews with size hints.
  - Save patch: `savepatch STEP file.json` writes the event’s output JSON for reuse with `inject`.
+  - Event batching: `event_batch_size` batches DB writes for throughput. For heavy runs, try `50` or `100`.
 
 Record‑time taps (determinism)
 ------------------------------
@@ -168,6 +172,7 @@ Examples
 
 - Example LangGraph factory: `examples/langgraph_demo/app.py` provides `make_graph()` for quick `--app` usage in CLI.
 - Freeze-time example: `examples/langgraph_demo/time_freeze_app.py` provides `make_graph_time()` that writes `timewarp.determinism.now()` into state so you can verify identical timestamps on replay with `--freeze-time`.
+- Parallel branches example: `examples/langgraph_demo/parallel_app.py` demonstrates fan-out and join with DECISION anchors.
 - Tests exercise recorder, diff alignment, replay state reconstruction, and playback installers.
 
 MCP Example (optional)
@@ -199,6 +204,12 @@ timewarp ./timewarp.db ./blobs events <run_id> --type TOOL --tool-kind MCP --jso
 Note: MCP metadata is best-effort and dependent on adapter/provider behavior. In environments
 where the stream does not emit tool metadata, you may not observe TOOL events for MCP calls.
 
+HITL & Privacy Docs
+-------------------
+
+- HITL patterns with LangGraph (DECISION anchors, snapshots, CLI tips): see `docs/hitl.md`.
+- Privacy marks and redaction strategies (`redact`, `mask4`) with examples: see `docs/privacy.md`.
+
 Time Provider & Freeze-Time
 ---------------------------
 
@@ -226,3 +237,39 @@ timewarp ./timewarp.db ./blobs inject <run_id> <step> --output alt.json \
 
 Example graph writes the ISO timestamp to state (key `now_iso`). With `--freeze-time`,
 replay preserves the exact value that was recorded.
+
+Replay Convenience Facade
+-------------------------
+
+You can also resume deterministically via a one-call facade:
+
+```
+from timewarp import Replay
+
+session = Replay.resume(
+    store,
+    app_factory="examples.langgraph_demo.app:make_graph",
+    run_id=<UUID>,
+    from_step=42,
+    thread_id="t-1",
+    strict_meta=True,
+    freeze_time=True,
+)
+print(session.result)
+```
+
+Exporters
+---------
+
+Use the CLI to export a run in a LangSmith-friendly JSON bundle:
+
+```
+timewarp ./timewarp.db ./blobs export langsmith <run_id> --include-blobs
+```
+
+The module `timewarp.exporters.langsmith` also exposes `serialize_run(...)` and `export_run(...)` for programmatic use.
+
+OpenTelemetry Quickstart
+------------------------
+
+See `docs/otel-quickstart.md` for a minimal setup to emit spans per event and link replay spans to recorded ones.
