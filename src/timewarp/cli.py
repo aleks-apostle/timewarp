@@ -28,6 +28,10 @@ def main(argv: list[str] | None = None) -> int:
     evp.add_argument(
         "--namespace", dest="namespace", default=None, help="Filter by namespace label"
     )
+    evp.add_argument(
+        "--tool-kind", dest="tool_kind", default=None, help="Filter by tool_kind (e.g., MCP)"
+    )
+    evp.add_argument("--tool-name", dest="tool_name", default=None, help="Filter by tool_name")
     evp.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON output")
 
     dbg = sub.add_parser("debug")
@@ -214,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
             node=(str(args.node) if getattr(args, "node", None) else None),
             thread=(str(args.thread_id) if getattr(args, "thread_id", None) else None),
             namespace=(str(args.namespace) if getattr(args, "namespace", None) else None),
+            tool_kind=(str(args.tool_kind) if getattr(args, "tool_kind", None) else None),
+            tool_name=(str(args.tool_name) if getattr(args, "tool_name", None) else None),
         )
         if getattr(args, "as_json", False):
             try:
@@ -828,6 +834,8 @@ def _filter_events(
     node: str | None,
     thread: str | None,
     namespace: str | None,
+    tool_kind: str | None = None,
+    tool_name: str | None = None,
 ) -> list[Event]:
     def _ok(e: Event) -> bool:
         if etype and e.action_type.value != etype:
@@ -837,6 +845,10 @@ def _filter_events(
         if thread and e.labels.get("thread_id") != thread:
             return False
         if namespace and e.labels.get("namespace") != namespace:
+            return False
+        if tool_kind and (e.tool_kind or "") != tool_kind:
+            return False
+        if tool_name and (e.tool_name or "") != tool_name:
             return False
         return True
 
