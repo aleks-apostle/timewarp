@@ -77,6 +77,8 @@ class LocalStore:
 
     db_path: Path
     blobs_root: Path
+    # Optional SQLite tuning knobs
+    busy_timeout_ms: int | None = 5000
 
     def __post_init__(self) -> None:
         self.blobs_root.mkdir(parents=True, exist_ok=True)
@@ -86,6 +88,18 @@ class LocalStore:
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
         con = sqlite3.connect(self.db_path)
+        # Apply PRAGMAs on every connection (journal mode is persistent; sync is per-connection)
+        try:
+            con.execute("PRAGMA journal_mode=WAL;")
+            con.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            pass
+        # Apply busy timeout if configured (helps under concurrent writers)
+        try:
+            if isinstance(self.busy_timeout_ms, int) and self.busy_timeout_ms > 0:
+                con.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_ms)};")
+        except Exception:
+            pass
         try:
             yield con
             con.commit()
@@ -205,6 +219,61 @@ class LocalStore:
                         ev_to_store.mcp_transport,
                     ),
                 )
+
+    def append_events(self, events: list[Event]) -> None:
+        """Append multiple events in a single transaction, preserving order.
+
+        Emits OTel spans per event similarly to append_event.
+        """
+        if not events:
+            return
+        with self._conn() as con:
+            for ev in events:
+                ev_to_store = ev
+                # Emit span and embed trace/span ids when available
+                with record_event_span(ev) as ids:
+                    trace_id_hex, span_id_hex = ids
+                    if trace_id_hex and span_id_hex:
+                        try:
+                            meta = dict(ev.model_meta or {})
+                            meta.setdefault("otel_trace_id", trace_id_hex)
+                            meta.setdefault("otel_span_id", span_id_hex)
+                            ev_to_store = ev.model_copy(update={"model_meta": meta})
+                        except Exception:
+                            ev_to_store = ev
+                    con.execute(
+                        """
+                    INSERT INTO events (
+                      run_id, step, action_type, actor, input_ref, output_ref, ts, rng_state,
+                      model_meta, hashes, parent_step, labels, privacy_marks, schema_version,
+                      tool_kind, tool_name, mcp_server, mcp_transport
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            str(ev_to_store.run_id),
+                            ev_to_store.step,
+                            ev_to_store.action_type.value,
+                            ev_to_store.actor,
+                            ev_to_store.input_ref.model_dump_json()
+                            if ev_to_store.input_ref
+                            else None,
+                            ev_to_store.output_ref.model_dump_json()
+                            if ev_to_store.output_ref
+                            else None,
+                            ev_to_store.ts.isoformat(),
+                            ev_to_store.rng_state,
+                            json.dumps(ev_to_store.model_meta) if ev_to_store.model_meta else None,
+                            json.dumps(ev_to_store.hashes),
+                            ev_to_store.parent_step,
+                            json.dumps(ev_to_store.labels),
+                            json.dumps(ev_to_store.privacy_marks),
+                            ev_to_store.schema_version,
+                            ev_to_store.tool_kind,
+                            ev_to_store.tool_name,
+                            ev_to_store.mcp_server,
+                            ev_to_store.mcp_transport,
+                        ),
+                    )
 
     def list_events(self, run_id: UUID) -> list[Event]:
         with self._conn() as con:

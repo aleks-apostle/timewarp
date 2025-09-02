@@ -35,6 +35,7 @@ class RecorderHandle:
     stream_subgraphs: bool
     require_thread_id: bool
     enable_record_taps: bool
+    event_batch_size: int = 20
 
     last_run_id: Any | None = None
 
@@ -59,6 +60,7 @@ class RecorderHandle:
             require_thread_id=self.require_thread_id,
             durability=self.durability,
             privacy_marks=self.privacy_marks,
+            event_batch_size=self.event_batch_size,
         )
         try:
             if self.enable_record_taps:
@@ -89,7 +91,8 @@ def wrap(
     state_pruner: Callable[[Any], Any] | None = None,
     stream_subgraphs: bool = True,
     require_thread_id: bool = False,
-    enable_record_taps: bool = False,
+    enable_record_taps: bool = True,
+    event_batch_size: int = 20,
 ) -> RecorderHandle:
     """Wrap a compiled LangGraph with a recorder facade.
 
@@ -107,10 +110,27 @@ def wrap(
     - state_pruner: Optional function to prune state payloads before persisting snapshots.
     - stream_subgraphs: Whether to request subgraph streaming (default: True).
     - require_thread_id: Enforce presence of configurable.thread_id in config.
+    - event_batch_size: Buffer and batch-append events (default: 20) for throughput.
     """
 
     if store is None:
         store = LocalStore(db_path=Path("timewarp.sqlite3"), blobs_root=Path("blobs"))
+    # Allow environment override for record taps: TIMEWARP_RECORD_TAPS=0 disables
+    eff_enable_taps = enable_record_taps
+    try:
+        import os as _os  # local import to keep core deterministic logic separate
+
+        val = _os.environ.get("TIMEWARP_RECORD_TAPS")
+        if val is not None:
+            v = val.strip().lower()
+            if v in {"0", "false", "no", "off"}:
+                eff_enable_taps = False
+            elif v in {"1", "true", "yes", "on"}:
+                eff_enable_taps = True
+    except Exception:
+        # best-effort; env parsing should never break
+        pass
+
     return RecorderHandle(
         graph=graph,
         store=store,
@@ -125,5 +145,6 @@ def wrap(
         state_pruner=state_pruner,
         stream_subgraphs=bool(stream_subgraphs),
         require_thread_id=bool(require_thread_id),
-        enable_record_taps=bool(enable_record_taps),
+        enable_record_taps=bool(eff_enable_taps),
+        event_batch_size=int(event_batch_size),
     )

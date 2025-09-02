@@ -28,6 +28,10 @@ def main(argv: list[str] | None = None) -> int:
     evp.add_argument(
         "--namespace", dest="namespace", default=None, help="Filter by namespace label"
     )
+    evp.add_argument(
+        "--tool-kind", dest="tool_kind", default=None, help="Filter by tool_kind (e.g., MCP)"
+    )
+    evp.add_argument("--tool-name", dest="tool_name", default=None, help="Filter by tool_name")
     evp.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON output")
 
     dbg = sub.add_parser("debug")
@@ -101,6 +105,18 @@ def main(argv: list[str] | None = None) -> int:
         dest="fail_on_divergence",
         action="store_true",
         help="Exit with non-zero status when a divergence is found",
+    )
+
+    # export subcommands
+    exp = sub.add_parser("export")
+    exp_sub = exp.add_subparsers(dest="exporter", required=True)
+    exp_ls = exp_sub.add_parser("langsmith")
+    exp_ls.add_argument("run_id", help="Run ID to export")
+    exp_ls.add_argument(
+        "--include-blobs",
+        dest="include_blobs",
+        action="store_true",
+        help="Inline small blobs as JSON where possible",
     )
 
     args = p.parse_args(argv)
@@ -214,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
             node=(str(args.node) if getattr(args, "node", None) else None),
             thread=(str(args.thread_id) if getattr(args, "thread_id", None) else None),
             namespace=(str(args.namespace) if getattr(args, "namespace", None) else None),
+            tool_kind=(str(args.tool_kind) if getattr(args, "tool_kind", None) else None),
+            tool_name=(str(args.tool_name) if getattr(args, "tool_name", None) else None),
         )
         if getattr(args, "as_json", False):
             try:
@@ -312,6 +330,30 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
         return 0
+
+    if args.cmd == "export":
+        if args.exporter == "langsmith":
+            try:
+                from uuid import UUID as _UUID
+
+                import orjson as _orjson
+
+                from timewarp.exporters.langsmith import serialize_run as _serialize_run
+            except Exception as exc:  # pragma: no cover - dependency/import errors
+                print("Export failed: missing dependencies:", exc)
+                return 1
+            payload = _serialize_run(
+                store, _UUID(args.run_id), include_blobs=bool(getattr(args, "include_blobs", False))
+            )
+            try:
+                print(_orjson.dumps(payload).decode("utf-8"))
+            except Exception:
+                import json as _json
+
+                print(_json.dumps(payload, ensure_ascii=False))
+            return 0
+        print("Unknown exporter:", args.exporter)
+        return 1
 
     if args.cmd == "resume":
         # Lazy import to avoid optional deps at CLI parse time
@@ -635,8 +677,8 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if line.startswith("inject "):
                 try:
-                    _, s, payload = line.split(maxsplit=2)
-                    rep.inject(int(s), __import__("json").loads(payload))
+                    _, s, payload_text = line.split(maxsplit=2)
+                    rep.inject(int(s), __import__("json").loads(payload_text))
                     print("Injected at step", s)
                 except Exception as e:  # pragma: no cover
                     print("Inject failed:", e)
@@ -828,6 +870,8 @@ def _filter_events(
     node: str | None,
     thread: str | None,
     namespace: str | None,
+    tool_kind: str | None = None,
+    tool_name: str | None = None,
 ) -> list[Event]:
     def _ok(e: Event) -> bool:
         if etype and e.action_type.value != etype:
@@ -837,6 +881,10 @@ def _filter_events(
         if thread and e.labels.get("thread_id") != thread:
             return False
         if namespace and e.labels.get("namespace") != namespace:
+            return False
+        if tool_kind and (e.tool_kind or "") != tool_kind:
+            return False
+        if tool_name and (e.tool_name or "") != tool_name:
             return False
         return True
 

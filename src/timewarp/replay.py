@@ -644,3 +644,53 @@ class Replay:
         # Refresh internal events timeline and position remains unchanged
         self._events = self.store.list_events(self.run_id)
         return ev
+
+    # --- convenience facade ---
+
+    @staticmethod
+    def resume(
+        store: LocalStore,
+        *,
+        app_factory: str,
+        run_id: UUID,
+        from_step: int | None = None,
+        thread_id: str | None = None,
+        strict_meta: bool = False,
+        freeze_time: bool = False,
+    ) -> ReplaySession:
+        """One-call resume for LangGraph runs using recorded outputs.
+
+        Parameters
+        - store: LocalStore instance
+        - app_factory: "module:function" that returns a compiled LangGraph
+        - run_id: run to resume
+        - from_step/thread_id: optional resume cursor and LangGraph thread id
+        - strict_meta: validate provider/model/params observed vs recorded
+        - freeze_time: freeze time to recorded event timestamps during replay
+        """
+        from importlib import import_module
+
+        mod_name, func_name = app_factory.split(":", 1)
+        mod = import_module(mod_name)
+        from collections.abc import Callable as _Callable
+        from typing import Any as _Any
+        from typing import cast as _cast
+
+        factory = _cast(_Callable[[], _Any], getattr(mod, func_name))
+        graph = factory()
+
+        from .adapters import installers as _installers
+
+        def _installer(llm: PlaybackLLM, tool: PlaybackTool) -> None:
+            llm.strict_meta = bool(strict_meta)
+            tool.strict_meta = bool(strict_meta)
+            _installers.bind_langgraph_playback(graph, llm, tool)
+
+        replayer = LangGraphReplayer(graph=graph, store=store)
+        return replayer.resume(
+            run_id=run_id,
+            from_step=from_step,
+            thread_id=thread_id,
+            install_wrappers=_installer,
+            freeze_time=freeze_time,
+        )

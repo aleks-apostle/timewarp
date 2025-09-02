@@ -45,6 +45,8 @@ class LangGraphRecorder:
     require_thread_id: bool = False
     durability: str | None = None  # e.g., "sync" | None; pass only when checkpointer present
     privacy_marks: dict[str, str] = field(default_factory=dict)
+    # Batch events to reduce SQLite write overhead while preserving order
+    event_batch_size: int = 1
 
     # Adapter metadata
     ADAPTER_VERSION: str = "0.1.0"
@@ -138,7 +140,7 @@ class LangGraphRecorder:
             model_meta={"adapter_version": self.ADAPTER_VERSION, "framework": "langgraph"},
             ts=tw_now(),
         )
-        self.store.append_event(ev)
+        self._append_event(ev)
         step += 1
 
         # Stream updates and emit events by node update completion.
@@ -246,6 +248,10 @@ class LangGraphRecorder:
             except Exception:
                 pass
 
+            # Label hash provenance (aggregated vs staged)
+            if prompt_hash:
+                labels2["hash_source"] = "aggregated"
+
             ev2 = Event(
                 run_id=self.run.run_id,
                 step=step,
@@ -272,10 +278,18 @@ class LangGraphRecorder:
                 if "prompt" not in ev2.hashes:
                     staged = try_pop_prompt_hash()
                     if staged:
-                        ev2 = ev2.model_copy(update={"hashes": {**ev2.hashes, "prompt": staged}})
+                        # Update label to reflect staged provenance (staged takes precedence)
+                        new_labels = dict(ev2.labels or {})
+                        new_labels["hash_source"] = "staged"
+                        ev2 = ev2.model_copy(
+                            update={
+                                "hashes": {**ev2.hashes, "prompt": staged},
+                                "labels": new_labels,
+                            }
+                        )
             except Exception:
                 pass
-            self.store.append_event(ev2)
+            self._append_event(ev2)
             step += 1
             # reset
             agg_key = None
@@ -470,6 +484,11 @@ class LangGraphRecorder:
                                 break
                     if cand is not None:
                         ev_hashes["prompt"] = hash_bytes(_to_bytes(cand))
+                        # Label hash provenance for non-messages LLM event
+                        try:
+                            ev_labels["hash_source"] = "aggregated"
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 # Merge staged prompt hash when stream metadata is insufficient
@@ -478,6 +497,11 @@ class LangGraphRecorder:
                         staged_p = try_pop_prompt_hash()
                         if staged_p:
                             ev_hashes["prompt"] = staged_p
+                            try:
+                                # Staged provenance takes precedence
+                                ev_labels["hash_source"] = "staged"
+                            except Exception:
+                                pass
                 except Exception:
                     pass
                 # Extract common LLM params from metadata when present (best-effort)
@@ -560,7 +584,7 @@ class LangGraphRecorder:
             if tool_meta:
                 ev = ev.model_copy(update=tool_meta)
 
-            self.store.append_event(ev)
+            self._append_event(ev)
             step += 1  # advance step after recording the update event
             updates_seen += 1
             # DECISION emission when values.next changes
@@ -601,7 +625,7 @@ class LangGraphRecorder:
                                 },
                                 ts=tw_now(),
                             )
-                            self.store.append_event(dec_ev)
+                            self._append_event(dec_ev)
                             step += 1
                             last_decision_key = decision_key
                             # Optional snapshot on decision
@@ -667,11 +691,13 @@ class LangGraphRecorder:
             # HITL detection best-effort directly from updates
             try:
                 if isinstance(upd, dict) and "__interrupt__" in upd:
+                    # Normalize into explicit envelope to make HITL events consistent
+                    _hitl_payload = {"hitl": {"type": "interrupt", "payload": upd["__interrupt__"]}}
                     hitl_blob = self.store.put_blob(
                         self.run.run_id,
                         step,
                         BlobKind.OUTPUT,
-                        self._normalize_bytes(upd["__interrupt__"]),
+                        self._normalize_bytes(_hitl_payload),
                     )
                     hitl_ev = Event(
                         run_id=self.run.run_id,
@@ -687,7 +713,7 @@ class LangGraphRecorder:
                         },
                         ts=tw_now(),
                     )
-                    self.store.append_event(hitl_ev)
+                    self._append_event(hitl_ev)
                     step += 1
             except Exception:  # pragma: no cover
                 pass
@@ -727,6 +753,8 @@ class LangGraphRecorder:
                 extra_labels2["checkpoint_id"] = cp2
             self._persist_snapshot(step, terminal_state, labels_extra=extra_labels2)
 
+        # Flush any pending events before returning
+        self._flush_events()
         # Return best-effort result without re-executing the graph
         if last_values is not None:
             return last_values
@@ -764,7 +792,31 @@ class LangGraphRecorder:
             model_meta={"adapter_version": self.ADAPTER_VERSION, "framework": "langgraph"},
             ts=tw_now(),
         )
-        self.store.append_event(ev)
+        self._append_event(ev)
+
+    # Event batching helpers
+    _pending_events: list[Event] = field(default_factory=list, init=False, repr=False)
+
+    def _append_event(self, ev: Event) -> None:
+        # Append with optional batching
+        bs = max(1, int(self.event_batch_size))
+        if bs == 1:
+            self.store.append_event(ev)
+            return
+        if not hasattr(self, "__pending_list"):
+            setattr(self, "__pending_list", [])
+        pending: list[Event] = getattr(self, "__pending_list")
+        pending.append(ev)
+        if len(pending) >= bs:
+            self.store.append_events(pending)
+            pending.clear()
+
+    def _flush_events(self) -> None:
+        if hasattr(self, "__pending_list"):
+            pending: list[Event] = getattr(self, "__pending_list")
+            if pending:
+                self.store.append_events(pending)
+                pending.clear()
 
     def _normalize_bytes(self, obj: Any) -> bytes:
         from ..codec import to_bytes
@@ -888,6 +940,23 @@ class LangGraphRecorder:
                 if update.get("mcp_transport"):
                     out2["mcp_transport"] = str(update.get("mcp_transport"))
                 return out2
+            # Additionally inspect nested metadata produced by messages stream
+            meta = update.get("metadata")
+            if isinstance(meta, dict):
+                name2 = meta.get("tool_name") or meta.get("name")
+                kind2 = meta.get("tool_kind")
+                if name2 and (
+                    kind2 == "MCP" or meta.get("mcp_server") or meta.get("mcp_transport")
+                ):
+                    out3: dict[str, str] = {
+                        "tool_kind": str(kind2 or "MCP"),
+                        "tool_name": str(name2),
+                    }
+                    if meta.get("mcp_server"):
+                        out3["mcp_server"] = str(meta.get("mcp_server"))
+                    if meta.get("mcp_transport"):
+                        out3["mcp_transport"] = str(meta.get("mcp_transport"))
+                    return out3
         return None
 
     def _extract_values(self, snapshot_or_obj: Any) -> dict[str, Any] | None:
