@@ -803,20 +803,17 @@ class LangGraphRecorder:
         if bs == 1:
             self.store.append_event(ev)
             return
-        if not hasattr(self, "__pending_list"):
-            setattr(self, "__pending_list", [])
-        pending: list[Event] = getattr(self, "__pending_list")
+        pending = self._pending_events
         pending.append(ev)
         if len(pending) >= bs:
             self.store.append_events(pending)
             pending.clear()
 
     def _flush_events(self) -> None:
-        if hasattr(self, "__pending_list"):
-            pending: list[Event] = getattr(self, "__pending_list")
-            if pending:
-                self.store.append_events(pending)
-                pending.clear()
+        pending = self._pending_events
+        if pending:
+            self.store.append_events(pending)
+            pending.clear()
 
     def _normalize_bytes(self, obj: Any) -> bytes:
         from ..codec import to_bytes
