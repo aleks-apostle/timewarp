@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import asyncio
+from collections.abc import AsyncIterable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from ..determinism import now as tw_now
 from ..determinism import snapshot_rng
@@ -65,106 +66,13 @@ class LangGraphRecorder:
         if not _maybe_langgraph_stream(self.graph):
             raise RuntimeError("graph does not support .stream; cannot record reliably")
 
-        # Register run
-        self.store.create_run(self.run)
-        step = 0
-
-        # Capture initial RNG
-        rng_before = snapshot_rng()
-
-        # Persist an initial SYS event for input envelope
-        input_blob = self.store.put_blob(
-            self.run.run_id, step, BlobKind.INPUT, self._normalize_bytes(inputs)
-        )
-        # Try to capture thread_id (if present) for easier correlation
-        thread_id: str | None = None
-        if isinstance(config, dict):
-            cfg = (
-                config.get("configurable") if isinstance(config.get("configurable"), dict) else None
-            )
-            if isinstance(cfg, dict):
-                tid = cfg.get("thread_id")
-                thread_id = str(tid) if isinstance(tid, str | int) else None
-
-        # Optional guard: when a checkpointer is expected, enforce thread_id presence
-        if self.require_thread_id and not thread_id:
-            raise ValueError(
-                "require_thread_id=True but no configurable.thread_id provided in config"
-            )
-
-        # Build labels for recorder context
-        labels: dict[str, str] = {}
-        if thread_id:
-            labels["thread_id"] = thread_id
-        # For SYS/input, set a neutral node label for alignment
-        labels["node"] = "graph"
-        # Propagate branch lineage onto the initial SYS event when present on Run
-        try:
-            if isinstance(self.run.labels, dict) and "branch_of" in self.run.labels:
-                bo = self.run.labels.get("branch_of")
-                if isinstance(bo, str) and bo:
-                    labels["branch_of"] = bo
-        except Exception:
-            pass
-        # Record recorder configuration to aid filtering/debug
-        try:
-            # normalize stream modes label
-            if self.stream_modes:
-                sm = (
-                    ",".join(self.stream_modes)
-                    if len(self.stream_modes) > 1
-                    else self.stream_modes[0]
-                )
-                labels["stream_mode"] = str(sm)
-            if self.stream_subgraphs:
-                labels["subgraphs"] = "true"
-            # Determine effective durability: if thread_id present and not
-            # explicitly set, prefer "sync"
-            effective_durability = self.durability
-            if effective_durability is None and thread_id:
-                effective_durability = "sync"
-            if effective_durability:
-                labels["durability"] = str(effective_durability)
-        except Exception:
-            pass
-
-        ev = Event(
-            run_id=self.run.run_id,
-            step=step,
-            action_type=ActionType.SYS,
-            actor="graph",
-            input_ref=input_blob,
-            rng_state=rng_before,
-            hashes={"input": input_blob.sha256_hex},
-            labels=labels,
-            model_meta={"adapter_version": self.ADAPTER_VERSION, "framework": "langgraph"},
-            ts=tw_now(),
-        )
-        self._append_event(ev)
-        step += 1
+        labels_ctx, thread_id, step = self._prepare_run_and_sys_event(inputs, config)
 
         # Stream updates and emit events by node update completion.
         # The concrete shape of updates is framework-specific; we record a summary.
         # Determine effective durability again for passing into stream()
-        effective_durability = self.durability
-        if effective_durability is None and thread_id:
-            effective_durability = "sync"
-
-        stream_kwargs: dict[str, Any] = {
-            "stream_mode": list(self.stream_modes)
-            if len(self.stream_modes) > 1
-            else (self.stream_modes[0] if self.stream_modes else "updates")
-        }
-        if self.stream_subgraphs:
-            stream_kwargs["subgraphs"] = True
-        if effective_durability is not None:
-            stream_kwargs["durability"] = effective_durability
-        try:
-            iterator = self.graph.stream(inputs, config or {}, **stream_kwargs)
-        except TypeError:
-            # some implementations may not accept subgraphs
-            stream_kwargs.pop("subgraphs", None)
-            iterator = self.graph.stream(inputs, config or {}, **stream_kwargs)
+        stream_kwargs = self._build_stream_kwargs(config, thread_id)
+        iterator = self._iter_stream_sync(self.graph, inputs, config, stream_kwargs)
 
         last_values: Any | None = None
         last_decision_key: str | None = None  # track last observed routing decision
@@ -762,6 +670,516 @@ class LangGraphRecorder:
             return terminal_state
         return None
 
+    # --- async entrypoint ---
+
+    async def ainvoke(self, inputs: dict[str, Any], *, config: dict[str, Any] | None = None) -> Any:
+        """Async invoke that mirrors invoke() semantics using graph.astream when available."""
+
+        # Feature detection: must have astream
+        has_astream = hasattr(self.graph, "astream") and callable(self.graph.astream)
+        if not has_astream:
+            raise RuntimeError("graph does not support .astream; cannot record async")
+
+        # Prepare run and initial SYS event
+        labels_ctx, thread_id, step = self._prepare_run_and_sys_event(inputs, config)
+
+        # Build stream kwargs mirroring sync
+        stream_kwargs = self._build_stream_kwargs(config, thread_id)
+
+        # Create async iterator, with subgraphs omission resilience
+        try:
+            async_iterator: AsyncIterable[Any] = cast(
+                AsyncIterable[Any], self.graph.astream(inputs, config or {}, **stream_kwargs)
+            )
+        except TypeError:
+            stream_kwargs.pop("subgraphs", None)
+            async_iterator = cast(
+                AsyncIterable[Any], self.graph.astream(inputs, config or {}, **stream_kwargs)
+            )
+
+        # Local per-run state, matching sync path
+        last_values: Any | None = None
+        last_decision_key: str | None = None
+        updates_seen = 0
+        single_mode_label: str | None = (
+            self.stream_modes[0] if len(self.stream_modes) == 1 else None
+        )
+        agg_key: tuple[str, str | None, str | None] | None = None
+        agg_chunks: list[dict[str, Any]] = []
+        agg_text: list[str] = []
+        agg_labels: dict[str, str] = {}
+        agg_actor: str | None = None
+
+        def flush_messages() -> None:
+            nonlocal step, agg_key, agg_chunks, agg_text, agg_labels, agg_actor
+            if agg_key is None:
+                return
+            chunks_payload: dict[str, Any] = {"chunks": agg_chunks}
+            chunks_b = self._normalize_bytes(chunks_payload)
+            chunks_ref = self.store.put_blob(self.run.run_id, step, BlobKind.STATE, chunks_b)
+            payload: dict[str, Any] = {
+                "message": {"content": "".join(agg_text)},
+                "metadata": {"chunks_count": len(agg_chunks)},
+                "chunks_ref": chunks_ref.model_dump(mode="json"),
+            }
+            payload_b2 = self._normalize_bytes(payload)
+            out_blob2 = self.store.put_blob(self.run.run_id, step, BlobKind.OUTPUT, payload_b2)
+            labels2 = dict(agg_labels)
+            labels2["stream_mode"] = "messages"
+            if agg_actor:
+                labels2.setdefault("node", agg_actor)
+            prompt_hash: str | None = None
+            provider: str | None = None
+            model: str | None = None
+            params_meta: dict[str, Any] = {}
+            try:
+                from ..codec import to_bytes as _to_bytes
+
+                sources: list[Any] = []
+                for ch in agg_chunks:
+                    meta = ch.get("metadata") if isinstance(ch, dict) else None
+                    if not isinstance(meta, dict):
+                        continue
+                    for key in ("llm_input_messages", "input_messages", "messages", "prompt"):
+                        if key in meta:
+                            sources.append(meta[key])
+                    if provider is None and isinstance(meta.get("provider"), str):
+                        provider = str(meta.get("provider"))
+                    if model is None and isinstance(meta.get("model"), str):
+                        model = str(meta.get("model"))
+                    for p in ("temperature", "top_p", "tool_choice"):
+                        val = meta.get(p)
+                        if val is None and isinstance(meta.get("params"), dict):
+                            params = meta["params"]
+                            try:
+                                val = params.get(p)
+                            except Exception:
+                                val = None
+                        if val is not None and p not in params_meta:
+                            if isinstance(val, str | int | float | bool):
+                                params_meta[p] = val
+                if sources:
+                    prompt_hash = hash_bytes(_to_bytes({"sources": sources}))
+            except Exception:
+                prompt_hash = None
+            try:
+                anchor_id2 = self._make_anchor_id(ActionType.LLM, agg_actor or "graph", labels2)
+                if anchor_id2:
+                    labels2["anchor_id"] = anchor_id2
+            except Exception:
+                pass
+            if prompt_hash:
+                labels2["hash_source"] = "aggregated"
+            ev2 = Event(
+                run_id=self.run.run_id,
+                step=step,
+                action_type=ActionType.LLM,
+                actor=agg_actor or "graph",
+                output_ref=out_blob2,
+                hashes=(
+                    {"output": out_blob2.sha256_hex}
+                    | ({"prompt": prompt_hash} if prompt_hash else {})
+                ),
+                labels=labels2,
+                model_meta={
+                    "adapter_version": self.ADAPTER_VERSION,
+                    "framework": "langgraph",
+                    "chunks_count": len(agg_chunks),
+                    **({"provider": provider} if provider else {}),
+                    **({"model": model} if model else {}),
+                    **params_meta,
+                },
+                ts=tw_now(),
+            )
+            try:
+                if "prompt" not in ev2.hashes:
+                    staged = try_pop_prompt_hash()
+                    if staged:
+                        new_labels = dict(ev2.labels or {})
+                        new_labels["hash_source"] = "staged"
+                        ev2 = ev2.model_copy(
+                            update={
+                                "hashes": {**ev2.hashes, "prompt": staged},
+                                "labels": new_labels,
+                            }
+                        )
+            except Exception:
+                pass
+            self._append_event(ev2)
+            step += 1
+            agg_key = None
+            agg_chunks = []
+            agg_text = []
+            agg_labels = {}
+            agg_actor = None
+
+        async for update in async_iterator:
+            stream_mode_label: str | None = None
+            namespace_label: str | None = None
+            upd = update
+
+            try:
+                if (
+                    isinstance(update, tuple | list)
+                    and len(update) == 3
+                    and isinstance(update[0], tuple | list)
+                    and isinstance(update[1], str)
+                ):
+                    ns = [str(x) for x in update[0]]
+                    namespace_label = "/".join(ns)
+                    stream_mode_label = update[1]
+                    upd = update[2]
+            except Exception:
+                pass
+
+            try:
+                if (
+                    isinstance(update, tuple | list)
+                    and len(update) == 2
+                    and isinstance(update[0], str)
+                ):
+                    stream_mode_label = update[0]
+                    upd = update[1]
+            except Exception:
+                pass
+
+            # Identify actor
+            actor = self._infer_actor(upd)
+            if stream_mode_label == "messages" or single_mode_label == "messages":
+                key: tuple[str, str | None, str | None] = (
+                    actor or "graph",
+                    namespace_label,
+                    thread_id,
+                )
+                if agg_key is None:
+                    agg_key = key
+                elif agg_key != key:
+                    flush_messages()
+                    agg_key = key
+                normalized: dict[str, Any]
+                if isinstance(upd, tuple | list) and len(upd) == 2:
+                    normalized = self._serialize_messages_tuple(upd)
+                elif isinstance(upd, dict) and (
+                    "message" in upd and "metadata" in upd and isinstance(upd["metadata"], dict)
+                ):
+                    normalized = upd  # already normalized
+                else:
+                    normalized = {"message": upd, "metadata": {}}
+                # Propagate labels for aggregated messages event
+                agg_labels = {}
+                if thread_id:
+                    agg_labels["thread_id"] = thread_id
+                if namespace_label:
+                    agg_labels["namespace"] = namespace_label
+                # Infer actor label
+                if actor and actor != "graph":
+                    agg_actor = actor
+                # Append chunk content
+                agg_chunks.append(normalized)
+                try:
+                    msg = normalized.get("message")
+                    if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                        agg_text.append(msg["content"])
+                    elif isinstance(msg, str):
+                        agg_text.append(msg)
+                except Exception:
+                    pass
+                continue
+
+            # Flush pending messages if non-messages update arrives
+            flush_messages()
+            payload_b = self._normalize_bytes(upd)
+            out_blob = self.store.put_blob(self.run.run_id, step, BlobKind.OUTPUT, payload_b)
+            ev_labels: dict[str, str] = {}
+            if stream_mode_label:
+                ev_labels["stream_mode"] = stream_mode_label
+            if namespace_label:
+                ev_labels["namespace"] = namespace_label
+            if thread_id:
+                ev_labels.setdefault("thread_id", thread_id)
+            if actor and actor != "graph":
+                ev_labels.setdefault("node", actor)
+
+            atype = self._infer_action_type(upd)
+            if stream_mode_label == "messages" or single_mode_label == "messages":
+                atype = ActionType.LLM
+            tool_meta: dict[str, str] | None = self._classify_tool_from_update(upd)
+            if tool_meta:
+                atype = ActionType.TOOL
+
+            base_meta = {"adapter_version": self.ADAPTER_VERSION, "framework": "langgraph"}
+            ev_meta: dict[str, Any] | None = None
+
+            ev_hashes: dict[str, str] = {"output": out_blob.sha256_hex}
+            if atype is ActionType.LLM:
+                try:
+                    from ..codec import to_bytes as _to_bytes
+
+                    cand = None
+                    if isinstance(upd, dict):
+                        for pkey in ("llm_input_messages", "input_messages", "messages", "prompt"):
+                            if pkey in upd:
+                                cand = upd[pkey]
+                                break
+                    if cand is not None:
+                        ev_hashes["prompt"] = hash_bytes(_to_bytes(cand))
+                        try:
+                            ev_labels["hash_source"] = "aggregated"
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    if "prompt" not in ev_hashes:
+                        staged_p = try_pop_prompt_hash()
+                        if staged_p:
+                            ev_hashes["prompt"] = staged_p
+                            try:
+                                ev_labels["hash_source"] = "staged"
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                try:
+                    meta_obj = upd.get("metadata") if isinstance(upd, dict) else None
+                    if isinstance(meta_obj, dict):
+                        try:
+                            prov = meta_obj.get("provider")
+                            mdl = meta_obj.get("model")
+                            if prov is not None:
+                                ev_meta = ev_meta or {}
+                                if isinstance(prov, str):
+                                    ev_meta["provider"] = prov
+                            if mdl is not None:
+                                ev_meta = ev_meta or {}
+                                if isinstance(mdl, str):
+                                    ev_meta["model"] = mdl
+                        except Exception:
+                            pass
+                        for p in ("temperature", "top_p", "tool_choice"):
+                            val = meta_obj.get(p)
+                            if val is None and isinstance(meta_obj.get("params"), dict):
+                                params2 = meta_obj["params"]
+                                try:
+                                    val = params2.get(p)
+                                except Exception:
+                                    val = None
+                            if val is not None:
+                                ev_meta = ev_meta or {}
+                                if isinstance(val, str | int | float | bool):
+                                    ev_meta[p] = val
+                except Exception:
+                    pass
+            if atype is ActionType.TOOL:
+                try:
+                    from ..codec import to_bytes as _to_bytes
+
+                    args_env = self._extract_tool_args(upd)
+                    if args_env is not None:
+                        ev_hashes["args"] = hash_bytes(_to_bytes(args_env))
+                except Exception:
+                    pass
+                try:
+                    if "args" not in ev_hashes:
+                        staged_a = try_pop_tool_args_hash()
+                        if staged_a:
+                            ev_hashes["args"] = staged_a
+                except Exception:
+                    pass
+
+            try:
+                tool_nm = None
+                if isinstance(upd, dict):
+                    tool_nm = str(upd.get("tool_name")) if upd.get("tool_name") else None
+                anchor_id = self._make_anchor_id(atype, actor, ev_labels, tool_nm)
+                if anchor_id:
+                    ev_labels["anchor_id"] = anchor_id
+            except Exception:
+                pass
+
+            ev = Event(
+                run_id=self.run.run_id,
+                step=step,
+                action_type=atype,
+                actor=actor,
+                output_ref=out_blob,
+                hashes=ev_hashes,
+                labels=ev_labels,
+                model_meta=(base_meta if ev_meta is None else {**base_meta, **ev_meta}),
+                ts=tw_now(),
+            )
+            if tool_meta:
+                ev = ev.model_copy(update=tool_meta)
+
+            self._append_event(ev)
+            step += 1
+            updates_seen += 1
+
+            try:
+                if (stream_mode_label == "values" or single_mode_label == "values") and isinstance(
+                    upd, dict
+                ):
+                    next_nodes = self._extract_next_nodes(upd)
+                    if next_nodes is not None:
+                        decision_key = "|".join(next_nodes)
+                        if decision_key != last_decision_key:
+                            dec_labels: dict[str, str] = {}
+                            if namespace_label:
+                                dec_labels["namespace"] = namespace_label
+                            if thread_id:
+                                dec_labels["thread_id"] = thread_id
+                            if actor and actor != "graph":
+                                dec_labels["node"] = actor
+                            try:
+                                dec_anchor = self._make_anchor_id(
+                                    ActionType.DECISION, actor, dec_labels
+                                )
+                                if dec_anchor:
+                                    dec_labels["anchor_id"] = dec_anchor
+                            except Exception:
+                                pass
+                            dec_labels["decision"] = decision_key
+                            dec_ev = Event(
+                                run_id=self.run.run_id,
+                                step=step,
+                                action_type=ActionType.DECISION,
+                                actor=actor or "router",
+                                labels=dec_labels,
+                                model_meta={
+                                    "adapter_version": self.ADAPTER_VERSION,
+                                    "framework": "langgraph",
+                                },
+                                ts=tw_now(),
+                            )
+                            self._append_event(dec_ev)
+                            step += 1
+                            last_decision_key = decision_key
+                            try:
+                                if "decision" in self.snapshot_on:
+                                    snap_payload_dec: Any | None = None
+                                    if last_values is not None and isinstance(
+                                        last_values, dict | list
+                                    ):
+                                        snap_payload_dec = last_values
+                                    else:
+                                        get_state = getattr(self.graph, "get_state", None)
+                                        if callable(get_state) and config:
+                                            snapshot = get_state(config)
+                                            snap_payload_dec = self._extract_values(snapshot)
+                                    if snap_payload_dec is not None:
+                                        extra_labels_dec: dict[str, str] = {}
+                                        if thread_id:
+                                            extra_labels_dec["thread_id"] = thread_id
+                                        cpd = self._extract_checkpoint_id(config, snap_payload_dec)
+                                        if cpd is not None:
+                                            extra_labels_dec["checkpoint_id"] = cpd
+                                        self._persist_snapshot(
+                                            step, snap_payload_dec, labels_extra=extra_labels_dec
+                                        )
+                                        step += 1
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            try:
+                if (stream_mode_label == "values" or single_mode_label == "values") and isinstance(
+                    upd, dict
+                ):
+                    last_values = upd
+            except Exception:
+                pass
+
+            if self.snapshot_every > 0 and updates_seen % self.snapshot_every == 0:
+                snap_payload: Any | None = None
+                if last_values is not None and isinstance(last_values, dict | list):
+                    snap_payload = last_values
+                else:
+                    try:
+                        get_state = getattr(self.graph, "get_state", None)
+                        if callable(get_state) and config:
+                            snapshot = get_state(config)
+                            snap_payload = self._extract_values(snapshot)
+                    except Exception:
+                        snap_payload = None
+                if snap_payload is not None:
+                    extra_labels: dict[str, str] = {}
+                    if thread_id:
+                        extra_labels["thread_id"] = thread_id
+                    cp = self._extract_checkpoint_id(config, snap_payload)
+                    if cp is not None:
+                        extra_labels["checkpoint_id"] = cp
+                    self._persist_snapshot(step, snap_payload, labels_extra=extra_labels)
+                    step += 1
+
+            try:
+                if isinstance(upd, dict) and "__interrupt__" in upd:
+                    _hitl_payload = {"hitl": {"type": "interrupt", "payload": upd["__interrupt__"]}}
+                    hitl_blob = self.store.put_blob(
+                        self.run.run_id,
+                        step,
+                        BlobKind.OUTPUT,
+                        self._normalize_bytes(_hitl_payload),
+                    )
+                    hitl_ev = Event(
+                        run_id=self.run.run_id,
+                        step=step,
+                        action_type=ActionType.HITL,
+                        actor=actor,
+                        output_ref=hitl_blob,
+                        hashes={"output": hitl_blob.sha256_hex},
+                        labels=(ev_labels if ev_labels else {}),
+                        model_meta={
+                            "adapter_version": self.ADAPTER_VERSION,
+                            "framework": "langgraph",
+                        },
+                        ts=tw_now(),
+                    )
+                    self._append_event(hitl_ev)
+                    step += 1
+            except Exception:
+                pass
+
+        # Flush remaining aggregated messages
+        flush_messages()
+
+        # Terminal state + optional snapshot
+        terminal_state: Any | None = None
+        try:
+            if self.require_thread_id:
+                th = (
+                    (config or {}).get("configurable", {}).get("thread_id")
+                    if isinstance(config, dict)
+                    else None
+                )
+                if not th:
+                    raise RuntimeError(
+                        "thread_id required by recorder but missing in config.configurable"
+                    )
+            get_state = getattr(self.graph, "get_state", None)
+            if callable(get_state) and config:
+                snapshot = get_state(config)
+                terminal_state = self._extract_values(snapshot)
+        except Exception:
+            terminal_state = None
+
+        if terminal_state is not None and "terminal" in (self.snapshot_on or {"terminal"}):
+            extra_labels2: dict[str, str] = {}
+            if thread_id:
+                extra_labels2["thread_id"] = thread_id
+            cp2 = self._extract_checkpoint_id(config, terminal_state)
+            if cp2 is not None:
+                extra_labels2["checkpoint_id"] = cp2
+            self._persist_snapshot(step, terminal_state, labels_extra=extra_labels2)
+
+        # Ensure any pending batched events are flushed; offload to thread to avoid blocking loop
+        await asyncio.to_thread(self._flush_events)
+
+        if last_values is not None:
+            return last_values
+        if terminal_state is not None:
+            return terminal_state
+        return None
+
     # --- helpers ---
 
     def _persist_snapshot(
@@ -793,6 +1211,113 @@ class LangGraphRecorder:
             ts=tw_now(),
         )
         self._append_event(ev)
+
+    # --- shared helpers for sync/async ---
+
+    def _prepare_run_and_sys_event(
+        self, inputs: dict[str, Any], config: dict[str, Any] | None
+    ) -> tuple[dict[str, str], str | None, int]:
+        """Create run, append the initial SYS event, return (labels, thread_id, next_step)."""
+        # Register run
+        self.store.create_run(self.run)
+        step = 0
+        rng_before = snapshot_rng()
+        input_blob = self.store.put_blob(
+            self.run.run_id, step, BlobKind.INPUT, self._normalize_bytes(inputs)
+        )
+        # thread id from config
+        thread_id: str | None = None
+        if isinstance(config, dict):
+            cfg = (
+                config.get("configurable") if isinstance(config.get("configurable"), dict) else None
+            )
+            if isinstance(cfg, dict):
+                tid = cfg.get("thread_id")
+                thread_id = str(tid) if isinstance(tid, str | int) else None
+
+        if self.require_thread_id and not thread_id:
+            raise ValueError(
+                "require_thread_id=True but no configurable.thread_id provided in config"
+            )
+
+        labels: dict[str, str] = {}
+        if thread_id:
+            labels["thread_id"] = thread_id
+        labels["node"] = "graph"
+        try:
+            if isinstance(self.run.labels, dict) and "branch_of" in self.run.labels:
+                bo = self.run.labels.get("branch_of")
+                if isinstance(bo, str) and bo:
+                    labels["branch_of"] = bo
+        except Exception:
+            pass
+        try:
+            if self.stream_modes:
+                sm = (
+                    ",".join(self.stream_modes)
+                    if len(self.stream_modes) > 1
+                    else self.stream_modes[0]
+                )
+                labels["stream_mode"] = str(sm)
+            if self.stream_subgraphs:
+                labels["subgraphs"] = "true"
+            effective_durability = self.durability
+            if effective_durability is None and thread_id:
+                effective_durability = "sync"
+            if effective_durability:
+                labels["durability"] = str(effective_durability)
+        except Exception:
+            pass
+
+        ev = Event(
+            run_id=self.run.run_id,
+            step=step,
+            action_type=ActionType.SYS,
+            actor="graph",
+            input_ref=input_blob,
+            rng_state=rng_before,
+            hashes={"input": input_blob.sha256_hex},
+            labels=labels,
+            model_meta={"adapter_version": self.ADAPTER_VERSION, "framework": "langgraph"},
+            ts=tw_now(),
+        )
+        self._append_event(ev)
+        return labels, thread_id, step + 1
+
+    def _build_stream_kwargs(
+        self, config: dict[str, Any] | None, thread_id: str | None
+    ) -> dict[str, Any]:
+        effective_durability = self.durability
+        if effective_durability is None and thread_id:
+            effective_durability = "sync"
+        stream_kwargs: dict[str, Any] = {
+            "stream_mode": list(self.stream_modes)
+            if len(self.stream_modes) > 1
+            else (self.stream_modes[0] if self.stream_modes else "updates"),
+        }
+        if self.stream_subgraphs:
+            stream_kwargs["subgraphs"] = True
+        if effective_durability is not None:
+            stream_kwargs["durability"] = effective_durability
+        return stream_kwargs
+
+    def _iter_stream_sync(
+        self,
+        graph: Any,
+        inputs: dict[str, Any],
+        config: dict[str, Any] | None,
+        stream_kwargs: dict[str, Any],
+    ) -> Iterable[Any]:
+        from typing import cast
+
+        try:
+            it = graph.stream(inputs, config or {}, **stream_kwargs)
+            return cast(Iterable[Any], it)
+        except TypeError:
+            stream_kwargs2 = dict(stream_kwargs)
+            stream_kwargs2.pop("subgraphs", None)
+            it2 = graph.stream(inputs, config or {}, **stream_kwargs2)
+            return cast(Iterable[Any], it2)
 
     # Event batching helpers
     _pending_events: list[Event] = field(default_factory=list, init=False, repr=False)
