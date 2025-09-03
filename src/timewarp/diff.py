@@ -175,3 +175,141 @@ def _to_text(obj: Any) -> str:
 
         return to_bytes(obj).decode("utf-8")
     return str(obj)
+
+
+def bisect_divergence(
+    store: LocalStore, run_a: UUID, run_b: UUID, *, window: int = 5
+) -> dict[str, int | str] | None:
+    """Find the smallest contiguous mismatching window between two runs.
+
+    - Anchors are aligned using a small lookahead window to skip benign reorders.
+    - If adapter/schema mismatch is detected, returns a trivial window at (0,0).
+    - If anchors cannot be realigned within the window, returns a single-step
+      window at the boundary with cause "anchor mismatch".
+    - Otherwise, returns a minimal window where at least one aligned pair differs
+      by output/state hash with cause "output hash mismatch".
+
+    Returns a dict with keys: start_a, end_a, start_b, end_b, cause; or None if
+    the runs are equivalent by anchors and output/state hashes.
+    """
+    evs_a = store.list_events(run_a)
+    evs_b = store.list_events(run_b)
+
+    # Early schema/adapter checks: treat as immediate incompatibility
+    if evs_a and evs_b and evs_a[0].schema_version != evs_b[0].schema_version:
+        return {
+            "start_a": 0,
+            "end_a": 0,
+            "start_b": 0,
+            "end_b": 0,
+            "cause": "adapter/schema mismatch",
+        }
+
+    def first_adapter_version(evs: list[Event]) -> str | None:
+        for e in evs:
+            mm = e.model_meta or {}
+            v = mm.get("adapter_version") if isinstance(mm, dict) else None
+            if isinstance(v, str):
+                return v
+        return None
+
+    av_a = first_adapter_version(evs_a)
+    av_b = first_adapter_version(evs_b)
+    if av_a and av_b and av_a != av_b:
+        return {
+            "start_a": 0,
+            "end_a": 0,
+            "start_b": 0,
+            "end_b": 0,
+            "cause": "adapter/schema mismatch",
+        }
+
+    def out_hash(ev: Event) -> str | None:
+        if ev.hashes and "output" in ev.hashes:
+            return ev.hashes["output"]
+        if ev.hashes and "state" in ev.hashes:
+            return ev.hashes["state"]
+        return None
+
+    i = 0
+    j = 0
+    n_a = len(evs_a)
+    n_b = len(evs_b)
+    WINDOW = max(1, int(window))
+    pairs: list[tuple[int, int]] = []
+
+    # Walk with realignment to gather comparable anchor pairs
+    while i < n_a and j < n_b:
+        a = evs_a[i]
+        b = evs_b[j]
+        if make_anchor_key(a) == make_anchor_key(b):
+            pairs.append((i, j))
+            i += 1
+            j += 1
+            continue
+        match_i, match_j = realign_by_anchor(evs_a, evs_b, start_a=i, start_b=j, window=WINDOW)
+        if match_i is not None or match_j is not None:
+            if match_i is not None and (
+                match_j is None or match_i - i <= (match_j - j if match_j is not None else 10**9)
+            ):
+                i = match_i
+            else:
+                j = match_j if match_j is not None else j
+            continue
+        # Could not align anchors within window: anchor mismatch
+        return {
+            "start_a": evs_a[i].step,
+            "end_a": evs_a[i].step,
+            "start_b": evs_b[j].step,
+            "end_b": evs_b[j].step,
+            "cause": "anchor mismatch",
+        }
+
+    # Equivalent by alignment if no pairs
+    if not pairs:
+        return None
+
+    # Predicate over a window [lo, hi] in pair indices: True if any mismatch in window
+    def mismatch(lo: int, hi: int) -> bool:
+        for k in range(lo, hi + 1):
+            ia, jb = pairs[k]
+            if out_hash(evs_a[ia]) != out_hash(evs_b[jb]):
+                return True
+        return False
+
+    # Quick scan: record all mismatching pair indices
+    mismatches: list[int] = [
+        idx for idx, (ia, jb) in enumerate(pairs) if out_hash(evs_a[ia]) != out_hash(evs_b[jb])
+    ]
+    if not mismatches:
+        # Fully aligned and all output/state hashes match (within aligned region)
+        # If lengths differ, surface the trailing delta as an anchor mismatch window
+        if len(evs_a) != len(evs_b):
+            if len(evs_a) > len(evs_b):
+                step_a = evs_a[len(evs_b)].step if len(evs_b) < len(evs_a) else evs_a[-1].step
+                step_b = evs_b[-1].step if evs_b else 0
+            else:
+                step_a = evs_a[-1].step if evs_a else 0
+                step_b = evs_b[len(evs_a)].step if len(evs_a) < len(evs_b) else evs_b[-1].step
+            return {
+                "start_a": step_a,
+                "end_a": step_a,
+                "start_b": step_b,
+                "end_b": step_b,
+                "cause": "anchor mismatch",
+            }
+        return None
+
+    # Minimal mismatching window is the single first mismatching aligned pair
+    left = mismatches[0]
+    right = left
+
+    ia_l, jb_l = pairs[left]
+    ia_r, jb_r = pairs[right]
+    return {
+        "start_a": evs_a[ia_l].step,
+        "end_a": evs_a[ia_r].step,
+        "start_b": evs_b[jb_l].step,
+        "end_b": evs_b[jb_r].step,
+        "cause": "output hash mismatch",
+    }

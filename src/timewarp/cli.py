@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from uuid import UUID
 
-from .diff import first_divergence
+from .diff import bisect_divergence, first_divergence
 from .events import ActionType, BlobRef, Event
 from .replay import Replay, ReplayError
 from .store import LocalStore
@@ -37,7 +37,17 @@ def main(argv: list[str] | None = None) -> int:
     dbg = sub.add_parser("debug")
     dbg.add_argument("run_id", help="Run ID")
 
-    res = sub.add_parser("resume")
+    res = sub.add_parser(
+        "resume",
+        help="Resume a run deterministically using recorded outputs",
+        description="Resume a run from a prior checkpoint using playback wrappers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Programmatic API: from timewarp import Replay\n"
+            'session = Replay.resume(store, app_factory="mod:make", run_id=<UUID>,\n'
+            '    from_step=<int|None>, thread_id="t-1", strict_meta=False, freeze_time=False)\n'
+        ),
+    )
     res.add_argument("run_id", help="Run ID")
     res.add_argument("--from", dest="from_step", type=int, default=None, help="Step to resume from")
     res.add_argument("--thread", dest="thread_id", default=None, help="Thread ID for LangGraph")
@@ -100,6 +110,9 @@ def main(argv: list[str] | None = None) -> int:
     ddf.add_argument("run_b")
     ddf.add_argument("--window", type=int, default=5, help="Anchor realignment window (default 5)")
     ddf.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON output")
+    ddf.add_argument(
+        "--bisect", dest="use_bisect", action="store_true", help="Find minimal failing window"
+    )
     ddf.add_argument(
         "--fail-on-divergence",
         dest="fail_on_divergence",
@@ -280,6 +293,46 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "diff":
+        use_bisect = bool(getattr(args, "use_bisect", False))
+        if use_bisect:
+            b = bisect_divergence(store, UUID(args.run_a), UUID(args.run_b), window=args.window)
+            if getattr(args, "as_json", False):
+                try:
+                    from typing import Any, cast
+
+                    import orjson as _orjson
+
+                    payload: object
+                    if b is None:
+                        payload = {"result": None}
+                    else:
+                        payload = cast(dict[str, Any], b)
+                    print(_orjson.dumps(payload).decode("utf-8"))
+                except Exception:
+                    import json as _json
+                    from typing import Any, cast
+
+                    payload2: object
+                    if b is None:
+                        payload2 = {"result": None}
+                    else:
+                        payload2 = cast(dict[str, Any], b)
+                    print(_json.dumps(payload2, ensure_ascii=False))
+                return 0
+            if b is None:
+                print("No divergence: runs equivalent by step/order/hashes")
+                return 0
+            print(
+                f"Minimal failing window: A[{b['start_a']}:{b['end_a']}], "
+                f"B[{b['start_b']}:{b['end_b']}] — cause={b['cause']}"
+            )
+            try:
+                if hasattr(args, "fail_on_divergence") and bool(args.fail_on_divergence):
+                    return 1
+            except Exception:
+                pass
+            return 0
+
         d = first_divergence(store, UUID(args.run_a), UUID(args.run_b), window=args.window)
         if getattr(args, "as_json", False):
             try:
