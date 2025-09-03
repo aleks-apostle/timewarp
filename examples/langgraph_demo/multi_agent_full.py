@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import operator
+
 # Full multi-agent LangGraph demo wired for Timewarp debugging.
 #
 # This example builds a representative multi-agent workflow with:
@@ -21,10 +24,10 @@ from __future__ import annotations
 # Programmatic resume is also shown in __main__.
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any, Literal
 
 
-def make_graph_multi() -> Any:
+def make_graph_multi(*, include_async: bool = False) -> Any:
     try:
         from typing_extensions import TypedDict
     except Exception:  # pragma: no cover - older Python fallback
@@ -33,6 +36,7 @@ def make_graph_multi() -> Any:
     try:
         from langgraph.checkpoint.memory import InMemorySaver
         from langgraph.graph import END, START, StateGraph
+        from langgraph.types import Command, interrupt
     except Exception as exc:  # pragma: no cover - optional dep
         raise RuntimeError("LangGraph is required for the multi-agent demo app") from exc
 
@@ -44,6 +48,7 @@ def make_graph_multi() -> Any:
         plan: str
         draft: str
         code_result: int
+        async_result: int
         report: str
         # Track for human node routing (optional)
         last_active_agent: str
@@ -54,6 +59,8 @@ def make_graph_multi() -> Any:
         mcp_transport: str
         args: list[Any]
         kwargs: dict[str, Any]
+        # Aggregate artifacts across parallel branches (use reducer to avoid conflicts)
+        artifacts: Annotated[list[str], operator.add]
 
     # Optional Fake chat model; we also embed LLM context into the update payload so
     # the recorder classifies the update as an LLM event even without messages stream.
@@ -132,35 +139,108 @@ def make_graph_multi() -> Any:
             "kwargs": {"op": "mul", "ssn": ssn},
             # Save the result to state
             "code_result": int(res),
+            "artifacts": ["code"],
         }
 
-    def human_review(state: State) -> dict[str, Any]:
-        # Request human input; recorder emits a HITL event from this envelope
-        return {"__interrupt__": {"reason": "Needs approval", "fields": ["plan", "code_result"]}}
+    async def tooling_async(state: State) -> dict[str, Any]:
+        # Simulate async workload (e.g., non-blocking I/O)
+        await asyncio.sleep(0.01)
+        a, b = 2, 5
+        res = a + b
+        return {"async_result": int(res), "artifacts": ["async"]}
+
+    def human_review(state: State) -> Command[Literal["review", "compose"]]:
+        # Request human input using official interrupt primitive
+        decision = interrupt(
+            {
+                "question": "Approve generated plan and results?",
+                "plan": state.get("plan", "<no plan>"),
+                "result": state.get("code_result", 0),
+            }
+        )
+        # Normalize to a boolean-like decision
+        if str(decision).strip().lower() in {"y", "yes", "approve", "approved", "true"}:
+            return Command(goto="review", update={"last_active_agent": "human"})
+        return Command(goto="compose", update={"last_active_agent": "human"})
 
     def compose(state: State) -> dict[str, Any]:
         plan = state.get("plan", "<no plan>")
         code = state.get("code_result", 0)
-        report = f"Plan={plan} | result={code}"
+        async_res = state.get("async_result", 0)
+        draft = state.get("draft", "<no draft>")
+        artifacts = (
+            ",".join(state.get("artifacts", [])) if isinstance(state.get("artifacts"), list) else ""
+        )
+        report = (
+            f"Plan={plan} | result={code}+{async_res} | draft={draft} | artifacts=[{artifacts}]"
+        )
         # Also add a message for pretty state
         msgs = list(state.get("messages", []))
         msgs.append({"role": "assistant", "content": report})
         return {"report": report, "messages": msgs}
 
+    # Subgraph: lightweight "review" pipeline that produces a draft, then light edit
+    class ReviewState(TypedDict, total=False):
+        messages: list[dict[str, Any]]
+        draft: str
+
+    def draft_writer(state: ReviewState) -> dict[str, Any]:
+        # Best-effort LLM-marked node
+        user_prompt = "Draft a short report section"
+        ai_text = "Draft created."
+        try:
+            if fake_llm is not None:
+                _ = fake_llm.invoke(user_prompt)
+        except Exception:
+            pass
+        return {
+            "llm_input_messages": [
+                {"role": "system", "content": "You are a writer"},
+                {"role": "user", "content": user_prompt},
+            ],
+            "message": {"role": "assistant", "content": ai_text},
+            "metadata": {"provider": "fake", "model": "fake-chat", "params": {"temperature": 0.0}},
+            "draft": ai_text,
+        }
+
+    def light_edit(state: ReviewState) -> dict[str, Any]:
+        d = state.get("draft", "")
+        return {"draft": d + " (edited)"}
+
+    # Build a subgraph for review
+    review = StateGraph(ReviewState)
+    review.add_node("draft_writer", draft_writer)
+    review.add_node("light_edit", light_edit)
+    review.add_edge(START, "draft_writer")
+    review.add_edge("draft_writer", "light_edit")
+    review_compiled = review.compile()
+
     g = StateGraph(State)
     g.add_node("triage", triage)
     g.add_node("planner", planner_llm)
     g.add_node("tooling", tooling)
+    if include_async:
+        g.add_node("tooling_async", tooling_async)
     g.add_node("human", human_review)
+    g.add_node("review", review_compiled)  # subgraph node
     g.add_node("compose", compose)
-    # Wire graph: fan-out, then human gate, then compose
+    # Wire graph: fan-out (planner + tooling + async),
+    # gate through human, subgraph, then compose
     g.add_edge(START, "triage")
     g.add_edge("triage", "planner")
     g.add_edge("triage", "tooling")
+    if include_async:
+        g.add_edge("triage", "tooling_async")
     # Join through a human gate to emit HITL
     g.add_edge("planner", "human")
     g.add_edge("tooling", "human")
+    if include_async:
+        g.add_edge("tooling_async", "human")
+    # Subgraph step (streams when subgraphs=True)
+    g.add_edge("human", "review")
+    # Allow dynamic routing to skip review
     g.add_edge("human", "compose")
+    g.add_edge("review", "compose")
     g.add_edge("compose", END)
 
     saver = InMemorySaver()
@@ -298,8 +378,8 @@ def _inject_what_if(run_id: Any) -> Any:
 
 
 if __name__ == "__main__":
-    # Build and record a run
-    graph = make_graph_multi()
+    # Build and record a sync run (graph without async nodes)
+    graph = make_graph_multi(include_async=False)
     recorder, result_state = _record_run(graph)
     print("Recorded run_id:", recorder.last_run_id)
     # Programmatic resume using recorded outputs (no network/tool side effects)
@@ -310,3 +390,29 @@ if __name__ == "__main__":
         print("Forked run recorded:", fork_id)
     else:
         print("No TOOL event found; skip fork")
+
+    # Record an async run to exercise astream path
+    async def _run_async() -> None:
+        from timewarp import messages_pruner, wrap
+
+        graph_async = make_graph_multi(include_async=True)
+        rec = wrap(
+            graph_async,
+            project="demo",
+            name="multi-agent-debug-async",
+            snapshot_every=5,
+            snapshot_on=("terminal", "decision"),
+            stream_modes=("updates", "messages", "values"),
+            state_pruner=messages_pruner(max_len=500, max_items=50),
+            enable_record_taps=True,
+            event_batch_size=20,
+        )
+        cfg: dict[str, Any] = {"configurable": {"thread_id": "t-demo-async"}}
+        _ = await rec.ainvoke({"messages": [{"role": "user", "content": "do work"}]}, config=cfg)
+        print("Recorded async run_id:", rec.last_run_id)
+
+    try:
+        asyncio.run(_run_async())
+    except Exception:
+        # Async path depends on graph.astream support; skip if unavailable
+        print("Async astream path unavailable; skipped")

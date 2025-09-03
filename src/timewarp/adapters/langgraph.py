@@ -40,6 +40,14 @@ class LangGraphRecorder:
     snapshot_on: set[str] = field(default_factory=lambda: {"terminal"})
     state_pruner: Callable[[Any], Any] | None = None
     tool_classifier: ToolClassifier | None = None
+    # Memory synthesis controls
+    memory_keys: Sequence[str] = ()  # dot paths within values/state to treat as memory
+    memory_pruner: Callable[[Any], Any] | None = None
+    # Retrieval detection (optional)
+    detect_retrieval: bool = False
+    retrieval_pruner: Callable[[Any], Any] | None = None
+    # Custom detector can override built-in heuristics; receives values/update payload
+    retrieval_detector: Callable[[Any], dict[str, Any] | None] | None = None
     # Defaults per plan: capture updates + values (full state deltas); messages can be opted in
     stream_modes: Sequence[str] = ("updates", "values")
     stream_subgraphs: bool = True
@@ -242,6 +250,8 @@ class LangGraphRecorder:
 
             # Build hashes with optional prompt hash for LLM
             ev_hashes: dict[str, str] = {"output": out_blob.sha256_hex}
+            input_ref = None
+            ev_tools_digest: str | None = None
             if atype is ActionType.LLM:
                 try:
                     from ..codec import to_bytes as _to_bytes
@@ -267,6 +277,39 @@ class LangGraphRecorder:
                             ev_labels["hash_source"] = "aggregated"
                         except Exception:
                             pass
+                except Exception:
+                    pass
+                # Tools digest and prompt context (async non-messages)
+                try:
+                    tools = self._extract_tools_from_update(upd)
+                    if tools is not None:
+                        from ..codec import to_bytes as _to_bytes
+                        from ..events import hash_bytes as _hash
+
+                        td = _hash(_to_bytes({"tools": tools}))
+                        ev_hashes["tools"] = td
+                        ctx_messages = None
+                        try:
+                            obs2 = upd if isinstance(upd, dict) else {}
+                            for pkey in (
+                                "llm_input_messages",
+                                "input_messages",
+                                "messages",
+                                "prompt",
+                            ):
+                                if isinstance(obs2, dict) and pkey in obs2:
+                                    ctx_messages = obs2[pkey]
+                                    break
+                        except Exception:
+                            ctx_messages = None
+                        if ctx_messages is not None:
+                            ctx_obj = {"messages": ctx_messages, "tools": tools}
+                            parts_b = self._normalize_bytes(ctx_obj)
+                            input_ref = self.store.put_blob(
+                                self.run.run_id, step, BlobKind.INPUT, parts_b
+                            )
+                            ev_hashes["prompt_ctx"] = _hash(_to_bytes(ctx_obj))
+                        ev_tools_digest = td
                 except Exception:
                     pass
                 # Merge staged prompt hash when stream metadata is insufficient
@@ -318,6 +361,40 @@ class LangGraphRecorder:
                                     ev_meta[p] = val
                 except Exception:
                     pass
+                # Optional: tools digest + prompt context blob
+                try:
+                    tools = self._extract_tools_from_update(upd)
+                    if tools is not None:
+                        from ..codec import to_bytes as _to_bytes
+                        from ..events import hash_bytes as _hash
+
+                        td = _hash(_to_bytes({"tools": tools}))
+                        ev_hashes["tools"] = td
+                        # prompt context combines messages and tools when messages are available
+                        ctx_messages = None
+                        try:
+                            obs2 = upd if isinstance(upd, dict) else {}
+                            for pkey in (
+                                "llm_input_messages",
+                                "input_messages",
+                                "messages",
+                                "prompt",
+                            ):
+                                if isinstance(obs2, dict) and pkey in obs2:
+                                    ctx_messages = obs2[pkey]
+                                    break
+                        except Exception:
+                            ctx_messages = None
+                        if ctx_messages is not None:
+                            ctx_obj = {"messages": ctx_messages, "tools": tools}
+                            parts_b = self._normalize_bytes(ctx_obj)
+                            input_ref = self.store.put_blob(
+                                self.run.run_id, step, BlobKind.INPUT, parts_b
+                            )
+                            ev_hashes["prompt_ctx"] = _hash(_to_bytes(ctx_obj))
+                        ev_tools_digest = td
+                except Exception:
+                    pass
             # Build tool args hash when actionable
             if atype is ActionType.TOOL:
                 try:
@@ -353,6 +430,9 @@ class LangGraphRecorder:
                 step=step,
                 action_type=atype,
                 actor=actor,
+                input_ref=(
+                    input_ref if atype is ActionType.LLM and input_ref is not None else None
+                ),
                 output_ref=out_blob,
                 hashes=ev_hashes,
                 labels=ev_labels,
@@ -361,10 +441,40 @@ class LangGraphRecorder:
             )
             if tool_meta:
                 ev = ev.model_copy(update=tool_meta)
+            if atype is ActionType.LLM and ev_tools_digest is not None:
+                ev = ev.model_copy(update={"tools_digest": ev_tools_digest})
 
             self._append_event(ev)
             step += 1  # advance step after recording the update event
             updates_seen += 1
+            # Emit MEMORY events synthesized from values stream (when configured)
+            try:
+                if (stream_mode_label == "values" or single_mode_label == "values") and isinstance(
+                    upd, dict
+                ):
+                    vals = self._extract_values(upd)
+                    if isinstance(vals, dict):
+                        if self.memory_keys:
+                            step = self._emit_memory_events(
+                                step=step,
+                                actor=actor,
+                                namespace_label=namespace_label,
+                                thread_id=thread_id,
+                                values=vals,
+                            )
+                        # Optional retrieval detection from values
+                        if self.detect_retrieval:
+                            env = self._detect_retrieval(vals)
+                            if isinstance(env, dict):
+                                step = self._emit_retrieval_event(
+                                    step=step,
+                                    actor=actor,
+                                    namespace_label=namespace_label,
+                                    thread_id=thread_id,
+                                    env=env,
+                                )
+            except Exception:  # pragma: no cover
+                pass
             # DECISION emission when values.next changes
             try:
                 if (stream_mode_label == "values" or single_mode_label == "values") and isinstance(
@@ -605,6 +715,8 @@ class LangGraphRecorder:
             provider: str | None = None
             model: str | None = None
             params_meta: dict[str, Any] = {}
+            tools_list: list[Any] = []
+            ctx_messages: Any | None = None
             _prompt_hash_failed = False
             try:
                 from ..codec import to_bytes as _to_bytes
@@ -617,6 +729,8 @@ class LangGraphRecorder:
                     for key in ("llm_input_messages", "input_messages", "messages", "prompt"):
                         if key in meta:
                             sources.append(meta[key])
+                            if ctx_messages is None:
+                                ctx_messages = meta[key]
                     if provider is None and isinstance(meta.get("provider"), str):
                         provider = str(meta.get("provider"))
                     if model is None and isinstance(meta.get("model"), str):
@@ -632,6 +746,15 @@ class LangGraphRecorder:
                         if val is not None and p not in params_meta:
                             if isinstance(val, str | int | float | bool):
                                 params_meta[p] = val
+                    # Collect tools list if exposed in metadata
+                    try:
+                        t = meta.get("tools") if isinstance(meta, dict) else None
+                        if t is None and isinstance(meta, dict):
+                            t = meta.get("available_tools")
+                        if isinstance(t, list) and t:
+                            tools_list.extend(t)
+                    except Exception:
+                        pass
                 if sources:
                     prompt_hash = hash_bytes(_to_bytes({"sources": sources}))
             except Exception:
@@ -645,16 +768,37 @@ class LangGraphRecorder:
                 pass
             if prompt_hash:
                 labels2["hash_source"] = "aggregated"
+            # Compute optional tools digest + prompt context
+            ev_hashes: dict[str, str] = {"output": out_blob2.sha256_hex}
+            if prompt_hash:
+                ev_hashes["prompt"] = prompt_hash
+            ev_tools_digest: str | None = None
+            input_ref = None
+            try:
+                if tools_list:
+                    from ..codec import to_bytes as _to_bytes
+                    from ..events import hash_bytes as _hash
+
+                    ev_tools_digest = _hash(_to_bytes({"tools": tools_list}))
+                    ev_hashes["tools"] = ev_tools_digest
+                    if ctx_messages is not None:
+                        ctx_obj = {"messages": ctx_messages, "tools": tools_list}
+                        parts_b = self._normalize_bytes(ctx_obj)
+                        input_ref = self.store.put_blob(
+                            self.run.run_id, step, BlobKind.INPUT, parts_b
+                        )
+                        ev_hashes["prompt_ctx"] = _hash(_to_bytes(ctx_obj))
+            except Exception:
+                pass
+
             ev2 = Event(
                 run_id=self.run.run_id,
                 step=step,
                 action_type=ActionType.LLM,
                 actor=agg_actor or "graph",
+                input_ref=input_ref,
                 output_ref=out_blob2,
-                hashes=(
-                    {"output": out_blob2.sha256_hex}
-                    | ({"prompt": prompt_hash} if prompt_hash else {})
-                ),
+                hashes=ev_hashes,
                 labels=labels2,
                 model_meta={
                     "adapter_version": self.ADAPTER_VERSION,
@@ -667,6 +811,8 @@ class LangGraphRecorder:
                 },
                 ts=tw_now(),
             )
+            if ev_tools_digest is not None:
+                ev2 = ev2.model_copy(update={"tools_digest": ev_tools_digest})
             try:
                 if "prompt" not in ev2.hashes:
                     staged = try_pop_prompt_hash()
@@ -762,6 +908,8 @@ class LangGraphRecorder:
             ev_meta: dict[str, Any] | None = None
 
             ev_hashes: dict[str, str] = {"output": out_blob.sha256_hex}
+            input_ref = None
+            ev_tools_digest: str | None = None
             if atype is ActionType.LLM:
                 try:
                     from ..codec import to_bytes as _to_bytes
@@ -853,6 +1001,9 @@ class LangGraphRecorder:
                 step=step,
                 action_type=atype,
                 actor=actor,
+                input_ref=(
+                    input_ref if atype is ActionType.LLM and input_ref is not None else None
+                ),
                 output_ref=out_blob,
                 hashes=ev_hashes,
                 labels=ev_labels,
@@ -861,10 +1012,40 @@ class LangGraphRecorder:
             )
             if tool_meta:
                 ev = ev.model_copy(update=tool_meta)
+            if atype is ActionType.LLM and ev_tools_digest is not None:
+                ev = ev.model_copy(update={"tools_digest": ev_tools_digest})
 
             self._append_event(ev)
             step += 1
             updates_seen += 1
+
+            # MEMORY synthesis from values stream when configured (async)
+            try:
+                if (stream_mode_label == "values" or single_mode_label == "values") and isinstance(
+                    upd, dict
+                ):
+                    vals = self._extract_values(upd)
+                    if isinstance(vals, dict):
+                        if self.memory_keys:
+                            step = self._emit_memory_events(
+                                step=step,
+                                actor=actor,
+                                namespace_label=namespace_label,
+                                thread_id=thread_id,
+                                values=vals,
+                            )
+                        if self.detect_retrieval:
+                            env = self._detect_retrieval(vals)
+                            if isinstance(env, dict):
+                                step = self._emit_retrieval_event(
+                                    step=step,
+                                    actor=actor,
+                                    namespace_label=namespace_label,
+                                    thread_id=thread_id,
+                                    env=env,
+                                )
+            except Exception:
+                pass
 
             try:
                 if (stream_mode_label == "values" or single_mode_label == "values") and isinstance(
@@ -1172,6 +1353,8 @@ class LangGraphRecorder:
 
     # Event batching helpers
     _pending_events: list[Event] = field(default_factory=list, init=False, repr=False)
+    # Memory synthesis state (path -> last item hash)
+    _tw_mem_prev: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def _append_event(self, ev: Event) -> None:
         # Append with optional batching
@@ -1219,6 +1402,302 @@ class LangGraphRecorder:
                 pass
             # - last resort: stable-ish repr envelope
             return to_bytes({"_repr": repr(redacted)})
+
+    # --- memory/tools helpers ---
+    def _get_by_path(self, root: dict[str, Any], path: str) -> Any | None:
+        try:
+            cur: Any = root
+            for seg in path.split("."):
+                if not isinstance(cur, dict) or seg not in cur:
+                    return None
+                cur = cur[seg]
+            return cur
+        except Exception:
+            return None
+
+    def _prune_mem_value(self, value: Any) -> Any:
+        if self.memory_pruner is None:
+            return value
+        try:
+            pruned = self.memory_pruner(value)
+            return pruned if isinstance(pruned, dict | list | str | int | float | bool) else value
+        except Exception:
+            return value
+
+    def _infer_mem_scope_from_path(self, path: str) -> str:
+        p = path.lower()
+        if "long" in p:
+            return "long"
+        if "short" in p:
+            return "short"
+        return "working"
+
+    def _emit_memory_events(
+        self,
+        *,
+        step: int,
+        actor: str,
+        namespace_label: str | None,
+        thread_id: str | None,
+        values: dict[str, Any],
+    ) -> int:
+        # Maintain last-seen memory item hashes on the instance
+        mem_prev: dict[str, str]
+        if not hasattr(self, "_tw_mem_prev"):
+            self._tw_mem_prev = {}
+        mem_prev = self._tw_mem_prev
+        for path in self.memory_keys:
+            v = self._get_by_path(values, path)
+            if v is None:
+                continue
+            pruned = self._prune_mem_value(v)
+            payload = {"key": path, "value": pruned}
+            data_b = self._normalize_bytes(payload)
+            blob = self.store.put_blob(self.run.run_id, step, BlobKind.MEMORY, data_b)
+            h = blob.sha256_hex
+            prev = mem_prev.get(path)
+            if prev is not None and prev == h:
+                continue  # unchanged
+            mem_prev[path] = h
+            labels: dict[str, str] = {}
+            if namespace_label:
+                labels["namespace"] = namespace_label
+            if thread_id:
+                labels["thread_id"] = thread_id
+            if actor and actor != "graph":
+                labels["node"] = actor
+            labels["mem_op"] = "PUT" if prev is None else "UPDATE"
+            labels["mem_scope"] = self._infer_mem_scope_from_path(path)
+            labels["mem_space"] = actor or "graph"
+            try:
+                labels["anchor_id"] = self._make_anchor_id(ActionType.MEMORY, actor, labels)
+            except Exception:
+                pass
+            ev = Event(
+                run_id=self.run.run_id,
+                step=step,
+                action_type=ActionType.MEMORY,
+                actor=actor or "graph",
+                output_ref=blob,
+                hashes={"item": h},
+                labels=labels,
+                model_meta={
+                    "adapter_version": self.ADAPTER_VERSION,
+                    "framework": "langgraph",
+                    "mem_provider": "LangGraphState",
+                },
+                ts=tw_now(),
+            )
+            # top-level convenience
+            ev = ev.model_copy(update={"mem_provider": "LangGraphState"})
+            self._append_event(ev)
+            step += 1
+        return step
+
+    # --- retrieval detection & emission ---
+    def _detect_retrieval(self, values_like: Any) -> dict[str, Any] | None:
+        """Best-effort detection of retrieval query/results within a values/update payload.
+
+        Returns a normalized envelope: {"query", "items", "top_k", "retriever", "query_id"}
+        or None when not detected.
+        """
+        try:
+            src = values_like
+            if isinstance(src, dict) and "values" in src and isinstance(src["values"], dict):
+                src = src["values"]
+            if not isinstance(src, dict):
+                return None
+            # Direct envelope
+            env: dict[str, Any] | None = None
+            cand = src.get("retrieval")
+            if isinstance(cand, dict):
+                env = dict(cand)
+            # Generic shapes with query + results/documents/docs
+            if env is None:
+                if "query" in src and isinstance(src.get("results"), list):
+                    env = {"query": src.get("query"), "items": src.get("results")}
+                elif "query" in src and isinstance(src.get("documents"), list):
+                    env = {"query": src.get("query"), "items": src.get("documents")}
+                elif "query" in src and isinstance(src.get("docs"), list):
+                    env = {"query": src.get("query"), "items": src.get("docs")}
+            if env is None:
+                return None
+
+            # Normalize items list -> list of {id, text, score, metadata}
+            items_raw = env.get("items") or env.get("results")
+            if not isinstance(items_raw, list) or not items_raw:
+                return None
+
+            def _norm_item(idx: int, it: Any) -> dict[str, Any]:
+                try:
+                    if not isinstance(it, dict):
+                        return {"id": str(idx), "text": str(it)}
+                    meta = it.get("metadata") or it.get("meta") or {}
+                    # text candidates
+                    txt = (
+                        it.get("text")
+                        or it.get("content")
+                        or it.get("page_content")
+                        or it.get("document")
+                        or (meta.get("text") if isinstance(meta, dict) else None)
+                    )
+                    # id candidates
+                    iid = it.get("id") or (meta.get("id") if isinstance(meta, dict) else None)
+                    # score from common fields
+                    score = it.get("score")
+                    if score is None:
+                        # sometimes similarity/distance used
+                        s = it.get("similarity")
+                        d = it.get("distance")
+                        score = (
+                            s
+                            if isinstance(s, int | float)
+                            else (d if isinstance(d, int | float) else None)
+                        )
+                    out = {
+                        "id": str(iid) if iid is not None else str(idx),
+                        "text": str(txt) if txt is not None else "",
+                        "metadata": meta if isinstance(meta, dict) else {},
+                    }
+                    if isinstance(score, int | float):
+                        out["score"] = float(score)
+                    return out
+                except Exception:
+                    return {"id": str(idx), "text": ""}
+
+            norm_items = [_norm_item(i, it) for i, it in enumerate(items_raw)]
+            query = env.get("query")
+            retriever = env.get("retriever") or src.get("retriever")
+            top_k = env.get("top_k") or src.get("top_k")
+            qid = env.get("query_id") or src.get("query_id")
+            out_env: dict[str, Any] = {
+                "query": query,
+                "items": norm_items,
+                "top_k": int(top_k)
+                if isinstance(top_k, int)
+                else (int(top_k) if isinstance(top_k, str) and top_k.isdigit() else None),
+                "retriever": str(retriever) if isinstance(retriever, str | int) else None,
+                "query_id": str(qid) if isinstance(qid, str | int) else None,
+            }
+
+            # Apply optional custom detector transformation or pruner
+            if self.retrieval_detector is not None:
+                try:
+                    custom = self.retrieval_detector(src)
+                    if isinstance(custom, dict) and custom.get("items"):
+                        out_env = custom
+                except Exception:
+                    pass
+            if self.retrieval_pruner is not None:
+                try:
+                    pruned = self.retrieval_pruner(out_env)
+                    if isinstance(pruned, dict) and pruned.get("items"):
+                        out_env = pruned
+                    elif isinstance(pruned, list):
+                        out_env = dict(out_env)
+                        out_env["items"] = pruned
+                except Exception:
+                    pass
+            return out_env
+        except Exception:  # pragma: no cover
+            return None
+
+    def _emit_retrieval_event(
+        self,
+        *,
+        step: int,
+        actor: str,
+        namespace_label: str | None,
+        thread_id: str | None,
+        env: dict[str, Any],
+    ) -> int:
+        try:
+            items = env.get("items")
+            if not isinstance(items, list) or not items:
+                return step
+            query = env.get("query")
+            retriever = env.get("retriever")
+            top_k = env.get("top_k")
+            query_id = env.get("query_id")
+            payload = {
+                "query": query,
+                "items": items,
+                "policy": {"retriever": retriever, "top_k": top_k},
+            }
+            data_b = self._normalize_bytes(payload)
+            blob = self.store.put_blob(self.run.run_id, step, BlobKind.MEMORY, data_b)
+            from ..codec import to_bytes as _to_bytes
+
+            hashes = {}
+            try:
+                if query is not None:
+                    hashes["query"] = hash_bytes(_to_bytes(query))
+            except Exception:
+                pass
+            try:
+                hashes["results"] = hash_bytes(_to_bytes({"items": items}))
+            except Exception:
+                pass
+            labels: dict[str, str] = {}
+            if namespace_label:
+                labels["namespace"] = namespace_label
+            if thread_id:
+                labels["thread_id"] = thread_id
+            if actor and actor != "graph":
+                labels["node"] = actor
+            try:
+                labels["anchor_id"] = self._make_anchor_id(ActionType.RETRIEVAL, actor, labels)
+            except Exception:
+                pass
+            ev = Event(
+                run_id=self.run.run_id,
+                step=step,
+                action_type=ActionType.RETRIEVAL,
+                actor=actor or "graph",
+                output_ref=blob,
+                hashes=hashes,
+                labels=labels,
+                model_meta={
+                    "adapter_version": self.ADAPTER_VERSION,
+                    "framework": "langgraph",
+                    "mem_provider": "LangGraphState",
+                },
+                ts=tw_now(),
+            )
+            # Convenience top-level fields for filtering
+            ev = ev.model_copy(
+                update={
+                    "retriever": retriever if isinstance(retriever, str) else None,
+                    "top_k": int(top_k) if isinstance(top_k, int) else None,
+                    "query_id": str(query_id) if isinstance(query_id, str | int) else None,
+                }
+            )
+            self._append_event(ev)
+            return step + 1
+        except Exception:  # pragma: no cover
+            return step
+
+    def _extract_tools_from_update(self, update: Any) -> list[Any] | None:
+        try:
+            obs = update
+            if isinstance(update, dict) and len(update) == 1:
+                try:
+                    ((_, inner),) = update.items()
+                    if isinstance(inner, dict):
+                        obs = inner
+                except Exception:
+                    obs = update
+            if not isinstance(obs, dict):
+                return None
+            meta = obs.get("metadata") if isinstance(obs.get("metadata"), dict) else None
+            tools = obs.get("tools")
+            if tools is None and isinstance(meta, dict):
+                tools = meta.get("tools") or meta.get("available_tools")
+            if isinstance(tools, list) and tools:
+                return tools
+        except Exception:
+            return None
+        return None
 
     def _serialize_messages_tuple(self, pair: Any) -> dict[str, Any]:
         """Normalize a (message_chunk, metadata) pair into JSON-serializable dict.
@@ -1339,11 +1818,13 @@ class LangGraphRecorder:
         if agg_actor:
             labels2.setdefault("node", agg_actor)
 
-        # Best-effort extraction for prompt hash, provider/model/params
+        # Best-effort extraction for prompt hash, provider/model/params, tools
         prompt_hash: str | None = None
         provider: str | None = None
         model: str | None = None
         params_meta: dict[str, Any] = {}
+        tools_list: list[Any] = []
+        ctx_messages: Any | None = None
         _prompt_hash_failed = False
         try:
             from ..codec import to_bytes as _to_bytes
@@ -1356,6 +1837,8 @@ class LangGraphRecorder:
                 for key in ("llm_input_messages", "input_messages", "messages", "prompt"):
                     if key in meta:
                         sources.append(meta[key])
+                        if ctx_messages is None:
+                            ctx_messages = meta[key]
                 if provider is None and isinstance(meta.get("provider"), str):
                     provider = str(meta.get("provider"))
                 if model is None and isinstance(meta.get("model"), str):
@@ -1371,6 +1854,15 @@ class LangGraphRecorder:
                     if val is not None and p not in params_meta:
                         if isinstance(val, str | int | float | bool):
                             params_meta[p] = val
+                # Tools: prefer explicit list under tools/available_tools
+                try:
+                    t = meta.get("tools") if isinstance(meta, dict) else None
+                    if t is None and isinstance(meta, dict):
+                        t = meta.get("available_tools")
+                    if isinstance(t, list) and t:
+                        tools_list.extend(t)
+                except Exception:
+                    pass
             if sources:
                 prompt_hash = hash_bytes(_to_bytes({"sources": sources}))
         except Exception:
@@ -1388,15 +1880,36 @@ class LangGraphRecorder:
         if prompt_hash:
             labels2["hash_source"] = "aggregated"
 
+        # Compute optional tools digest + prompt context blob
+        ev_hashes: dict[str, str] = {"output": out_blob2.sha256_hex}
+        if prompt_hash:
+            ev_hashes["prompt"] = prompt_hash
+        ev_tools_digest: str | None = None
+        input_ref = None
+        try:
+            if tools_list:
+                from ..codec import to_bytes as _to_bytes
+                from ..events import hash_bytes as _hash
+
+                # Normalize as a stable envelope for hashing
+                ev_tools_digest = _hash(_to_bytes({"tools": tools_list}))
+                ev_hashes["tools"] = ev_tools_digest
+                if ctx_messages is not None:
+                    ctx_obj = {"messages": ctx_messages, "tools": tools_list}
+                    parts_b = self._normalize_bytes(ctx_obj)
+                    input_ref = self.store.put_blob(self.run.run_id, step, BlobKind.INPUT, parts_b)
+                    ev_hashes["prompt_ctx"] = _hash(_to_bytes(ctx_obj))
+        except Exception:
+            pass
+
         ev2 = Event(
             run_id=self.run.run_id,
             step=step,
             action_type=ActionType.LLM,
             actor=agg_actor or "graph",
+            input_ref=input_ref,
             output_ref=out_blob2,
-            hashes=(
-                {"output": out_blob2.sha256_hex} | ({"prompt": prompt_hash} if prompt_hash else {})
-            ),
+            hashes=ev_hashes,
             labels=labels2,
             model_meta={
                 "adapter_version": self.ADAPTER_VERSION,
@@ -1409,6 +1922,8 @@ class LangGraphRecorder:
             },
             ts=tw_now(),
         )
+        if ev_tools_digest is not None:
+            ev2 = ev2.model_copy(update={"tools_digest": ev_tools_digest})
         # Merge a staged prompt hash when not present
         try:
             if "prompt" not in ev2.hashes:
