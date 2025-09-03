@@ -285,7 +285,10 @@ class LangGraphReplayer:
             )
             if has_side_effects:
                 raise AdapterInvariant(
-                    "install_wrappers callback is required to bind PlaybackLLM/Tool for replay"
+                    "Playback wrappers required: detected LLM/TOOL events in run. "
+                    "Install adapters via `uv pip install -e .[adapters]` and bind with "
+                    "`installers.bind_langgraph_playback(graph, llm, tool)`, or use the CLI "
+                    "`resume` command which binds automatically."
                 )
         else:
             install_wrappers(llm, tool)
@@ -315,7 +318,11 @@ class LangGraphReplayer:
         elif hasattr(self.graph, "invoke") and callable(self.graph.invoke):
             result = self.graph.invoke(inputs, cfg)
         else:
-            raise AdapterInvariant("graph does not support .stream or .invoke for replay")
+            raise AdapterInvariant(
+                "Graph does not support .stream or .invoke for replay. "
+                "Ensure your app factory returns a compiled LangGraph or use the CLI `resume` "
+                "which binds playback wrappers for you."
+            )
         return ReplaySession(
             run_id=run_id,
             checkpoint_id=checkpoint_id,

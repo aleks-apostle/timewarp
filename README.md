@@ -22,6 +22,7 @@ What’s Included (v0.1 core)
   - Privacy redaction via `privacy_marks`
 - Diff engine
   - Anchor‑aware alignment + windowed realignment; DeepDiff/text diffs; first divergence
+  - Delta debugging: minimal failing window via `diff --bisect`
 - Replay scaffolding
   - `PlaybackLLM`/`PlaybackTool` inject recorded outputs with prompt/args validation
   - `LangGraphReplayer.resume()` re‑executes from nearest checkpoint using recorded outputs
@@ -109,6 +110,29 @@ timewarp ./timewarp.db ./blobs debug <run_id>
 timewarp ./timewarp.db ./blobs diff <run_a> <run_b>
 timewarp ./timewarp.db ./blobs events <run_id> --type LLM --node compose --thread t-1 --json
 ```
+
+Delta Debugging (Minimal Failing Delta)
+---------------------------------------
+
+Find the smallest contiguous mismatching window between two runs, accounting for
+anchor‑aware realignment to skip benign reorders:
+
+```
+# Text output
+timewarp ./timewarp.db ./blobs diff <run_a> <run_b> --bisect
+
+# JSON output (machine‑readable)
+timewarp ./timewarp.db ./blobs diff <run_a> <run_b> --bisect --json
+# => {"start_a": <int>, "end_a": <int>, "start_b": <int>, "end_b": <int>, "cause": <str>} | {"result": null}
+
+# Tune anchor lookahead window (default 5)
+timewarp ./timewarp.db ./blobs diff <run_a> <run_b> --bisect --window 3
+```
+
+Notes
+- Causes: "output hash mismatch" | "anchor mismatch" | "adapter/schema mismatch".
+- Benign reorders (by matching anchors) are excluded from the window.
+- If all aligned pairs match but lengths differ, the trailing unmatched step is reported with cause "anchor mismatch".
 
 Deterministic Replay & What‑ifs (CLI)
 -------------------------------------

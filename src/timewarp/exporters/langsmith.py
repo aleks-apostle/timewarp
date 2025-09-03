@@ -1,8 +1,21 @@
-"""Optional LangSmith exporter stub.
+"""LangSmith-friendly export helpers.
 
-This module provides a minimal serialization helper that prepares a run and its
-events for export to external systems (e.g., LangSmith). It avoids hard
-dependencies; callers can pass in their own client and perform the upload.
+Purpose
+- Provide JSON-like payloads suitable for sending to LangSmith or similar tools.
+- Avoid hard dependencies; callers supply their own client object.
+
+Mapping
+- ``serialize_run`` returns a dict with two keys:
+  - ``run``: ``Run.model_dump(mode="json")`` — run metadata only.
+  - ``events``: list of ``Event.model_dump(mode="json")`` for each event.
+    When ``include_blobs=True``, the following keys may be inlined per event:
+    - ``input_payload``: decoded JSON for ``input_ref`` blob if present/JSON.
+    - ``output_payload``: decoded JSON for ``output_ref`` blob if present/JSON.
+
+Caveats
+- Redaction/encryption occur before persistence; exported payload reflects stored bytes.
+- Hashes are computed over stored (possibly redacted/encrypted) content.
+- Token chunks from messages aggregation are referenced via ``chunks_ref`` only.
 """
 
 from __future__ import annotations
@@ -20,8 +33,9 @@ def serialize_run(
 ) -> dict[str, Any]:
     """Serialize run metadata and events to a JSON-like dict.
 
-    - When include_blobs is True, small blobs are inlined as JSON payloads when
-      possible; otherwise only BlobRef metadata is included.
+    - ``include_blobs=True`` attempts to inline small JSON blobs as
+      ``input_payload``/``output_payload`` fields; otherwise only BlobRef
+      metadata is included on events.
     """
     runs = {r.run_id: r for r in store.list_runs()}
     run = runs.get(run_id)
@@ -48,10 +62,12 @@ def serialize_run(
 
 
 def export_run(store: LocalStore, run_id: UUID, *, client: Any | None = None) -> dict[str, Any]:
-    """Prepare export payload; if a client is provided, invoke a best-effort upload.
+    """Prepare export payload; optionally invoke a client to upload.
 
-    The exact client API is left to the caller to avoid hard dependencies. The
-    returned payload can be written to disk or used directly by custom tooling.
+    - If ``client`` is provided and exposes ``create_run(payload)``, it is called
+      best-effort with the serialized payload. Errors are swallowed intentionally
+      to avoid hard coupling to external SDKs.
+    - The returned payload can be written to disk or consumed by custom tools.
     """
     payload = serialize_run(store, run_id, include_blobs=False)
     # If a client is provided, perform a best-effort send using common conventions

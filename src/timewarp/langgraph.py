@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,44 @@ class RecorderHandle:
             if callable(teardown):
                 try:
                     teardown()
+                except Exception:
+                    pass
+        self.last_run_id = run.run_id
+        return result
+
+    async def ainvoke(self, inputs: dict[str, Any], config: dict[str, Any] | None = None) -> Any:
+        run = Run(
+            project=self.project,
+            name=self.name,
+            framework="langgraph",
+            labels=self.labels,
+            started_at=tw_now(),
+        )
+        teardown: Any | None = None
+        recorder = LangGraphRecorder(
+            graph=self.graph,
+            store=self.store,
+            run=run,
+            snapshot_every=self.snapshot_every,
+            snapshot_on=self.snapshot_on,
+            state_pruner=self.state_pruner,
+            stream_modes=self.stream_modes,
+            stream_subgraphs=self.stream_subgraphs,
+            require_thread_id=self.require_thread_id,
+            durability=self.durability,
+            privacy_marks=self.privacy_marks,
+            event_batch_size=self.event_batch_size,
+        )
+        try:
+            if self.enable_record_taps:
+                teardown = bind_langgraph_record()
+            # Prefer native async recording
+            result = await recorder.ainvoke(inputs, config=config or {})
+        finally:
+            if callable(teardown):
+                try:
+                    # Teardown is currently sync best-effort; run it in a thread to avoid blocking
+                    await asyncio.to_thread(teardown)
                 except Exception:
                     pass
         self.last_run_id = run.run_id

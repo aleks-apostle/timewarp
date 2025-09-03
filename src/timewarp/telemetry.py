@@ -6,7 +6,6 @@ from contextlib import contextmanager
 from typing import Any
 
 # Optional OpenTelemetry imports via importlib to keep mypy happy when not installed
-# Optional OpenTelemetry imports via importlib to keep mypy happy when not installed
 _otel_trace: Any = None
 _OtelLink: Any | None = None
 _OtelSpanContext: Any | None = None
