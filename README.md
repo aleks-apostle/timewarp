@@ -198,7 +198,128 @@ Examples
 - Example LangGraph factory: `examples/langgraph_demo/app.py` provides `make_graph()` for quick `--app` usage in CLI.
 - Freeze-time example: `examples/langgraph_demo/time_freeze_app.py` provides `make_graph_time()` that writes `timewarp.determinism.now()` into state so you can verify identical timestamps on replay with `--freeze-time`.
 - Parallel branches example: `examples/langgraph_demo/parallel_app.py` demonstrates fan-out and join with DECISION anchors.
+
+Multi‑Agent Demo
+----------------
+
+A realistic multi‑agent LangGraph with mock tools, a fake LLM, human‑in‑the‑loop (HITL), subgraphs, and dynamic routing:
+
+- File: `examples/langgraph_demo/multi_agent_full.py`
+- Features:
+  - LLM events with prompt hashing via record‑time taps (FakeListChatModel)
+  - TOOL events with MCP‑style metadata (`tool_name`, `mcp_server`, `mcp_transport`) and args hashing
+  - Human‑in‑the‑loop using `langgraph.types.interrupt` + `Command(goto=...)`
+  - Subgraph for review (`draft_writer` → `light_edit`) and dynamic routing to skip review
+  - Snapshots on terminal + decisions; message‑rich state for pruning/pretty printing
+- Run it to record a run and demonstrate resume + what‑if:
+
+```
+uv run python -m examples.langgraph_demo.multi_agent_full
+
+# Inspect with CLI (defaults: ./timewarp.sqlite3 ./blobs)
+uv run timewarp ./timewarp.sqlite3 ./blobs list
+uv run timewarp ./timewarp.sqlite3 ./blobs debug <run_id>
+```
+
+End‑to‑End Script (Record → Resume → Fork → Diff)
+------------------------------------------------
+
+For a single, repeatable flow that exercises most features, use:
+
+- File: `examples/langgraph_demo/run_all.py`
+- What it does:
+  - Builds the multi‑agent graph and records a baseline run
+  - Resumes deterministically from the nearest checkpoint (no side‑effects)
+  - Forks the run by overriding the first TOOL/LLM output (what‑if), records the branch
+  - Computes first divergence and minimal failing window between base and fork
+- Uses a dedicated store by default to avoid local schema drift:
+  - DB: `tw_runs/demo.sqlite3`
+  - Blobs: `tw_runs/blobs/`
+- Run:
+
+```
+uv run python -m examples.langgraph_demo.run_all
+# => prints JSON with run IDs, first divergence, and minimal window
+```
+
+Notes
+- Install adapters if you haven’t already: `uv pip install -e .[adapters]` (brings `langgraph` and `langchain-core`).
+- For CLI `resume`/`inject`, pass your app factory (e.g., `examples.langgraph_demo.app:make_graph` or `examples.langgraph_demo.multi_agent_full:make_graph_multi`).
+- Full multi‑agent example: `examples/langgraph_demo/multi_agent_full.py` exercises LLM, TOOL,
+  DECISION, HITL, SNAPSHOT, subgraphs, parallel fan‑out with reducers, and async paths.
 - Tests exercise recorder, diff alignment, replay state reconstruction, and playback installers.
+
+Full Multi‑Agent Demo
+---------------------
+
+Record a representative multi‑agent workflow and exercise the debugger end‑to‑end:
+
+```
+python -m examples.langgraph_demo.multi_agent_full
+# prints: Recorded run_id: <UUID>
+# also records a what‑if fork and, if supported, an async run
+```
+
+The script builds a graph with:
+- LLM nodes (`planner`, `review:draft_writer`) and staged prompt hashes.
+- TOOL node (`tooling`) with MCP‑like metadata and privacy redaction on kwargs.
+- Parallel branches (`planner`, `tooling`, optional `tooling_async`) merged via a
+  reducer on `artifacts` to avoid concurrent update conflicts.
+- A `human` HITL interrupt, DECISION events on routing, and periodic/terminal snapshots.
+- A `review` subgraph that streams when `stream_subgraphs=True`.
+
+After recording, explore via CLI (defaults write to `./timewarp.sqlite3` and `./blobs`):
+
+```
+timewarp ./timewarp.sqlite3 ./blobs list
+timewarp ./timewarp.sqlite3 ./blobs debug <run_id>
+```
+
+Resume deterministically and run a what‑if injection (using this demo’s factory):
+
+```
+timewarp ./timewarp.sqlite3 ./blobs resume <run_id> \
+  --app examples.langgraph_demo.multi_agent_full:make_graph_multi \
+  --thread t-demo --freeze-time
+
+timewarp ./timewarp.sqlite3 ./blobs inject <run_id> <step> \
+  --output alt.json \
+  --app examples.langgraph_demo.multi_agent_full:make_graph_multi \
+  --thread t-demo --record-fork --freeze-time
+```
+
+Event Filters Cheatsheet
+------------------------
+
+Focus on specific slices of the run quickly:
+
+```
+# Only TOOL events (MCP) from the tooling node
+timewarp ./timewarp.sqlite3 ./blobs events <run_id> \
+  --type TOOL --tool-kind MCP --node tooling --json
+
+# Only LLM events from the planner node
+timewarp ./timewarp.sqlite3 ./blobs events <run_id> --type LLM --node planner --json
+
+# HITL interrupts from the human node
+timewarp ./timewarp.sqlite3 ./blobs events <run_id> --type HITL --node human --json
+
+# LLM events emitted inside the review subgraph (match by namespace)
+timewarp ./timewarp.sqlite3 ./blobs events <run_id> --type LLM --namespace review --json
+
+# All DECISION anchors, useful to understand routing and joins
+timewarp ./timewarp.sqlite3 ./blobs events <run_id> --type DECISION --json
+```
+
+Notes
+-----
+
+- The demo records one sync run (no async nodes) to keep `.invoke()` compatible,
+  then tries an async run with `make_graph_multi(include_async=True)` using `.ainvoke()`.
+- If your environment does not provide `graph.astream`, the async run is skipped.
+- When using `wrap(...)` without an explicit `LocalStore`, the default DB path is
+  `./timewarp.sqlite3` (examples above use that). Earlier examples may reference
+  `./timewarp.db`; both are supported if you pass matching paths on the CLI.
 
 MCP Example (optional)
 ----------------------

@@ -19,12 +19,15 @@ class ActionType(StrEnum):
     SNAPSHOT = "SNAPSHOT"
     SYS = "SYS"
     ERROR = "ERROR"
+    MEMORY = "MEMORY"
+    RETRIEVAL = "RETRIEVAL"
 
 
 class BlobKind(StrEnum):
     INPUT = "input"
     OUTPUT = "output"
     STATE = "state"
+    MEMORY = "memory"
 
 
 class BlobRef(BaseModel):
@@ -57,7 +60,7 @@ class Run(BaseModel):
     finished_at: datetime | None = None
     status: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
-    schema_version: int = 1
+    schema_version: int = 2
 
 
 class Event(BaseModel):
@@ -81,13 +84,23 @@ class Event(BaseModel):
     parent_step: int | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     privacy_marks: dict[str, str] = Field(default_factory=dict)
-    schema_version: int = 1
+    schema_version: int = 2
 
     # Adapter-specific observational metadata (kept explicit to avoid nesting arbitrary blobs)
     tool_kind: str | None = None  # e.g., "MCP" for MCP tool calls
     tool_name: str | None = None
     mcp_server: str | None = None  # URL or server id when tool_kind=="MCP"
     mcp_transport: str | None = None  # stdio | streamable_http
+    # Prompt/tools context digest (stable hash of tools list/specs)
+    tools_digest: str | None = None
+    # Memory / retrieval specific observational fields
+    mem_op: str | None = None  # PUT | UPDATE | DELETE | EVICT | READ
+    mem_scope: str | None = None  # short | working | long
+    mem_space: str | None = None  # logical namespace/container
+    mem_provider: str | None = None  # LangGraphState | Mem0 | LlamaIndex | Custom
+    query_id: str | None = None  # retrieval request id
+    retriever: str | None = None  # vector | hybrid | router
+    top_k: int | None = None
 
     _canonical_bytes: bytes | None = PrivateAttr(default=None)
 

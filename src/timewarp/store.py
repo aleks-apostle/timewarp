@@ -49,6 +49,14 @@ CREATE TABLE IF NOT EXISTS events (
   tool_name TEXT,
   mcp_server TEXT,
   mcp_transport TEXT,
+  tools_digest TEXT,
+  mem_op TEXT,
+  mem_scope TEXT,
+  mem_space TEXT,
+  mem_provider TEXT,
+  query_id TEXT,
+  retriever TEXT,
+  top_k INTEGER,
   PRIMARY KEY (run_id, step)
 );
 
@@ -193,8 +201,13 @@ class LocalStore:
                 INSERT INTO events (
                   run_id, step, action_type, actor, input_ref, output_ref, ts, rng_state,
                   model_meta, hashes, parent_step, labels, privacy_marks, schema_version,
-                  tool_kind, tool_name, mcp_server, mcp_transport
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  tool_kind, tool_name, mcp_server, mcp_transport,
+                  tools_digest, mem_op, mem_scope, mem_space,
+                  mem_provider, query_id, retriever, top_k
+                ) VALUES (
+                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                     (
                         str(ev_to_store.run_id),
@@ -217,6 +230,14 @@ class LocalStore:
                         ev_to_store.tool_name,
                         ev_to_store.mcp_server,
                         ev_to_store.mcp_transport,
+                        ev_to_store.tools_digest,
+                        ev_to_store.mem_op,
+                        ev_to_store.mem_scope,
+                        ev_to_store.mem_space,
+                        ev_to_store.mem_provider,
+                        ev_to_store.query_id,
+                        ev_to_store.retriever,
+                        ev_to_store.top_k,
                     ),
                 )
 
@@ -246,8 +267,13 @@ class LocalStore:
                     INSERT INTO events (
                       run_id, step, action_type, actor, input_ref, output_ref, ts, rng_state,
                       model_meta, hashes, parent_step, labels, privacy_marks, schema_version,
-                      tool_kind, tool_name, mcp_server, mcp_transport
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      tool_kind, tool_name, mcp_server, mcp_transport,
+                      tools_digest, mem_op, mem_scope, mem_space,
+                      mem_provider, query_id, retriever, top_k
+                    ) VALUES (
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?
+                    )
                     """,
                         (
                             str(ev_to_store.run_id),
@@ -272,13 +298,28 @@ class LocalStore:
                             ev_to_store.tool_name,
                             ev_to_store.mcp_server,
                             ev_to_store.mcp_transport,
+                            ev_to_store.tools_digest,
+                            ev_to_store.mem_op,
+                            ev_to_store.mem_scope,
+                            ev_to_store.mem_space,
+                            ev_to_store.mem_provider,
+                            ev_to_store.query_id,
+                            ev_to_store.retriever,
+                            ev_to_store.top_k,
                         ),
                     )
 
     def list_events(self, run_id: UUID) -> list[Event]:
         with self._conn() as con:
             cur = con.execute(
-                "SELECT * FROM events WHERE run_id=? ORDER BY step ASC", (str(run_id),)
+                (
+                    "SELECT run_id, step, action_type, actor, input_ref, output_ref, ts, "
+                    "rng_state, model_meta, hashes, parent_step, labels, privacy_marks, "
+                    "schema_version, tool_kind, tool_name, mcp_server, mcp_transport, "
+                    "tools_digest, mem_op, mem_scope, mem_space, mem_provider, query_id, "
+                    "retriever, top_k FROM events WHERE run_id=? ORDER BY step ASC"
+                ),
+                (str(run_id),),
             )
             rows = cur.fetchall()
         events: list[Event] = []
@@ -302,6 +343,14 @@ class LocalStore:
                 tool_name,
                 mcp_server,
                 mcp_transport,
+                tools_digest,
+                mem_op,
+                mem_scope,
+                mem_space,
+                mem_provider,
+                query_id,
+                retriever,
+                top_k,
             ) = r
 
             def parse_blob(s: str | None) -> BlobRef | None:
@@ -329,6 +378,14 @@ class LocalStore:
                     tool_name=tool_name,
                     mcp_server=mcp_server,
                     mcp_transport=mcp_transport,
+                    tools_digest=tools_digest,
+                    mem_op=mem_op,
+                    mem_scope=mem_scope,
+                    mem_space=mem_space,
+                    mem_provider=mem_provider,
+                    query_id=query_id,
+                    retriever=retriever,
+                    top_k=top_k,
                 )
             )
         return events
