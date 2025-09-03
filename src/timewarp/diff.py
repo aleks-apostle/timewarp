@@ -300,34 +300,9 @@ def bisect_divergence(
             }
         return None
 
-    # Bisect to find minimal window containing a mismatch (leftmost index)
-    lo = 0
-    hi = len(pairs) - 1
-    # Ensure the predicate is True for the full range, else narrow around mismatches
-    if not mismatch(lo, hi):
-        # Should not happen given mismatches list above, but guard anyway
-        # Narrow search to [first_mismatch, last_mismatch]
-        lo = mismatches[0]
-        hi = mismatches[-1]
-    # Standard binary search for leftmost True
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if mismatch(lo, mid):
-            hi = mid
-        else:
-            lo = mid + 1
-    left = lo
-
-    # Optionally find right bound (will equal left under "any mismatch" predicate)
-    r_lo = left
-    r_hi = len(pairs) - 1
-    while r_lo < r_hi:
-        mid = (r_lo + r_hi + 1) // 2
-        if mismatch(left, mid):
-            r_lo = mid
-        else:
-            r_hi = mid - 1
-    right = r_lo
+    # Minimal mismatching window is the single first mismatching aligned pair
+    left = mismatches[0]
+    right = left
 
     ia_l, jb_l = pairs[left]
     ia_r, jb_r = pairs[right]
