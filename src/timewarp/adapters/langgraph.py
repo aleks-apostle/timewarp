@@ -247,10 +247,18 @@ class LangGraphRecorder:
                     from ..codec import to_bytes as _to_bytes
 
                     cand = None
-                    if isinstance(upd, dict):
+                    obs = upd
+                    if isinstance(upd, dict) and len(upd) == 1:
+                        try:
+                            ((_, inner),) = upd.items()
+                            if isinstance(inner, dict):
+                                obs = inner
+                        except Exception:
+                            obs = upd
+                    if isinstance(obs, dict):
                         for pkey in ("llm_input_messages", "input_messages", "messages", "prompt"):
-                            if pkey in upd:
-                                cand = upd[pkey]
+                            if pkey in obs:
+                                cand = obs[pkey]
                                 break
                     if cand is not None:
                         ev_hashes["prompt"] = hash_bytes(_to_bytes(cand))
@@ -1438,11 +1446,19 @@ class LangGraphRecorder:
     def _infer_action_type(self, update: Any) -> ActionType:
         # Heuristic classification: messages stream or token-like -> LLM; tool -> TOOL; else SYS
         try:
-            if isinstance(update, dict):
-                if "tool" in update or "tool_name" in update or update.get("tool_kind"):
+            obs = update
+            if isinstance(update, dict) and len(update) == 1:
+                try:
+                    ((_, inner),) = update.items()
+                    if isinstance(inner, dict):
+                        obs = inner
+                except Exception:
+                    obs = update
+            if isinstance(obs, dict):
+                if "tool" in obs or "tool_name" in obs or obs.get("tool_kind"):
                     return ActionType.TOOL
                 # messages stream commonly includes token tuples or message metadata
-                if "messages" in update or "llm_input_messages" in update:
+                if "messages" in obs or "llm_input_messages" in obs:
                     return ActionType.LLM
         except Exception:
             pass
@@ -1450,9 +1466,17 @@ class LangGraphRecorder:
 
     def _classify_tool_from_update(self, update: Any) -> dict[str, str] | None:
         # Allow user-provided classifier to recognize MCP calls (recommended)
-        if self.tool_classifier and hasattr(update, "get"):
+        obs = update
+        try:
+            if isinstance(update, dict) and len(update) == 1:
+                ((_, inner),) = update.items()
+                if isinstance(inner, dict):
+                    obs = inner
+        except Exception:
+            obs = update
+        if self.tool_classifier and hasattr(obs, "get"):
             # If the update contains a reference to the tool object
-            tool_obj = update.get("tool") if isinstance(update, dict) else None
+            tool_obj = obs.get("tool") if isinstance(obs, dict) else None
             if tool_obj is not None:
                 meta = self.tool_classifier(tool_obj)
                 if meta:
@@ -1467,21 +1491,21 @@ class LangGraphRecorder:
                         out["mcp_transport"] = str(meta["mcp_transport"])  # ensure str
                     return out
         # Heuristic for messages-mode structures
-        if isinstance(update, dict):
-            name = update.get("tool_name") or update.get("name")
-            kind = update.get("tool_kind")
+        if isinstance(obs, dict):
+            name = obs.get("tool_name") or obs.get("name")
+            kind = obs.get("tool_kind")
             if name and (kind == "MCP" or update.get("mcp_server") or update.get("mcp_transport")):
                 out2: dict[str, str] = {
                     "tool_kind": str(kind or "MCP"),
                     "tool_name": str(name),
                 }
-                if update.get("mcp_server"):
-                    out2["mcp_server"] = str(update.get("mcp_server"))
-                if update.get("mcp_transport"):
-                    out2["mcp_transport"] = str(update.get("mcp_transport"))
+                if obs.get("mcp_server"):
+                    out2["mcp_server"] = str(obs.get("mcp_server"))
+                if obs.get("mcp_transport"):
+                    out2["mcp_transport"] = str(obs.get("mcp_transport"))
                 return out2
             # Additionally inspect nested metadata produced by messages stream
-            meta = update.get("metadata")
+            meta = obs.get("metadata")
             if isinstance(meta, dict):
                 name2 = meta.get("tool_name") or meta.get("name")
                 kind2 = meta.get("tool_kind")
@@ -1592,11 +1616,19 @@ class LangGraphRecorder:
         Normalizes into the envelope expected by PlaybackTool: {"args": [...], "kwargs": {...}}
         """
         try:
-            if not isinstance(update, dict):
+            obs = update
+            if isinstance(update, dict) and len(update) == 1:
+                try:
+                    ((_, inner),) = update.items()
+                    if isinstance(inner, dict):
+                        obs = inner
+                except Exception:
+                    obs = update
+            if not isinstance(obs, dict):
                 return None
-            if "args" in update or "kwargs" in update:
-                args_v = update.get("args", [])
-                kwargs_v = update.get("kwargs", {})
+            if "args" in obs or "kwargs" in obs:
+                args_v = obs.get("args", [])
+                kwargs_v = obs.get("kwargs", {})
                 # Ensure shapes are JSON-serializable
                 if not isinstance(kwargs_v, dict):
                     try:
@@ -1611,7 +1643,7 @@ class LangGraphRecorder:
                     norm_args = [args_v]
                 return {"args": norm_args, "kwargs": kwargs_v}
             # Alternative containers
-            ta = update.get("tool_args")
+            ta = obs.get("tool_args")
             if isinstance(ta, dict):
                 a = ta.get("args", [])
                 k = ta.get("kwargs", {})
@@ -1624,10 +1656,10 @@ class LangGraphRecorder:
                 else:
                     norm_a = [a]
                 return {"args": norm_a, "kwargs": k}
-            inp = update.get("input")
+            inp = obs.get("input")
             if isinstance(inp, dict):
                 return {"args": [], "kwargs": inp}
-            params = update.get("parameters")
+            params = obs.get("parameters")
             if isinstance(params, dict):
                 return {"args": [], "kwargs": params}
         except Exception:

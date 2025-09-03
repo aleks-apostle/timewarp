@@ -21,10 +21,13 @@ docs/planned-next.md
 docs/timewarp-project.md
 docs/task-breakdown.md
 tw_runs/
+blobs/
 scripts/
 # Project folders to ignore
 SPRINTS/
 .docs/
+timewarp.sqlite3
+timewarp.db
 
 # Python bytecode and caches
 **/__pycache__/
