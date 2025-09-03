@@ -133,6 +133,7 @@ Notes
 - Causes: "output hash mismatch" | "anchor mismatch" | "adapter/schema mismatch".
 - Benign reorders (by matching anchors) are excluded from the window.
 - If all aligned pairs match but lengths differ, the trailing unmatched step is reported with cause "anchor mismatch".
+- Exit codes: add `--fail-on-divergence` to return a non‑zero exit code when a divergence is found (applies to text and `--json` modes).
 
 Deterministic Replay & What‑ifs (CLI)
 -------------------------------------

@@ -297,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
         if use_bisect:
             b = bisect_divergence(store, UUID(args.run_a), UUID(args.run_b), window=args.window)
             if getattr(args, "as_json", False):
+                exit_code = 0
                 try:
                     from typing import Any, cast
 
@@ -307,6 +308,13 @@ def main(argv: list[str] | None = None) -> int:
                         payload = {"result": None}
                     else:
                         payload = cast(dict[str, Any], b)
+                        try:
+                            if hasattr(args, "fail_on_divergence") and bool(
+                                args.fail_on_divergence
+                            ):
+                                exit_code = 1
+                        except Exception:
+                            pass
                     print(_orjson.dumps(payload).decode("utf-8"))
                 except Exception:
                     import json as _json
@@ -317,8 +325,15 @@ def main(argv: list[str] | None = None) -> int:
                         payload2 = {"result": None}
                     else:
                         payload2 = cast(dict[str, Any], b)
+                        try:
+                            if hasattr(args, "fail_on_divergence") and bool(
+                                args.fail_on_divergence
+                            ):
+                                exit_code = 1
+                        except Exception:
+                            pass
                     print(_json.dumps(payload2, ensure_ascii=False))
-                return 0
+                return exit_code
             if b is None:
                 print("No divergence: runs equivalent by step/order/hashes")
                 return 0
@@ -335,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
 
         d = first_divergence(store, UUID(args.run_a), UUID(args.run_b), window=args.window)
         if getattr(args, "as_json", False):
+            exit_code = 0
             try:
                 import orjson as _orjson
 
@@ -349,6 +365,11 @@ def main(argv: list[str] | None = None) -> int:
                         "diff_struct": d.diff_struct,
                         "diff_text": d.diff_text,
                     }
+                    try:
+                        if hasattr(args, "fail_on_divergence") and bool(args.fail_on_divergence):
+                            exit_code = 1
+                    except Exception:
+                        pass
                 print(_orjson.dumps(diff_payload).decode("utf-8"))
             except Exception:
                 import json as _json
@@ -364,8 +385,13 @@ def main(argv: list[str] | None = None) -> int:
                         "diff_struct": d.diff_struct,
                         "diff_text": d.diff_text,
                     }
+                    try:
+                        if hasattr(args, "fail_on_divergence") and bool(args.fail_on_divergence):
+                            exit_code = 1
+                    except Exception:
+                        pass
                 print(_json.dumps(payload_json, ensure_ascii=False))
-            return 0
+            return exit_code
         if d is None:
             print("No divergence: runs equivalent by step/order/hashes")
             return 0

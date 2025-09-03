@@ -91,114 +91,15 @@ class LangGraphRecorder:
             nonlocal step, agg_key, agg_chunks, agg_text, agg_labels, agg_actor
             if agg_key is None:
                 return
-            # Persist chunks separately (optional) to keep main payload compact
-            chunks_payload: dict[str, Any] = {"chunks": agg_chunks}
-            chunks_b = self._normalize_bytes(chunks_payload)
-            # Use STATE kind as a secondary blob for this step (no SNAPSHOT event is created here)
-            chunks_ref = self.store.put_blob(self.run.run_id, step, BlobKind.STATE, chunks_b)
-            payload: dict[str, Any] = {
-                "message": {"content": "".join(agg_text)},
-                "metadata": {"chunks_count": len(agg_chunks)},
-                # Provide a reference to the token chunks blob for later inspection
-                "chunks_ref": chunks_ref.model_dump(mode="json"),
-            }
-            payload_b2 = self._normalize_bytes(payload)
-            out_blob2 = self.store.put_blob(self.run.run_id, step, BlobKind.OUTPUT, payload_b2)
-            labels2 = dict(agg_labels)
-            labels2["stream_mode"] = "messages"
-            if agg_actor:
-                labels2.setdefault("node", agg_actor)
-            # Best-effort extraction of prompt/source messages for hashing and provider/model/params
-            prompt_hash: str | None = None
-            provider: str | None = None
-            model: str | None = None
-            params_meta: dict[str, Any] = {}
-            try:
-                from ..codec import to_bytes as _to_bytes
-
-                sources: list[Any] = []
-                for ch in agg_chunks:
-                    meta = ch.get("metadata") if isinstance(ch, dict) else None
-                    if not isinstance(meta, dict):
-                        continue
-                    for key in ("llm_input_messages", "input_messages", "messages", "prompt"):
-                        if key in meta:
-                            sources.append(meta[key])
-                    if provider is None and isinstance(meta.get("provider"), str):
-                        provider = str(meta.get("provider"))
-                    if model is None and isinstance(meta.get("model"), str):
-                        model = str(meta.get("model"))
-                    # Extract common LLM params when available
-                    for p in ("temperature", "top_p", "tool_choice"):
-                        val = meta.get(p)
-                        if val is None and isinstance(meta.get("params"), dict):
-                            params = meta["params"]
-                            try:
-                                val = params.get(p)
-                            except Exception:
-                                val = None
-                        if val is not None and p not in params_meta:
-                            try:
-                                # keep only JSON-serializable scalars
-                                if isinstance(val, str | int | float | bool):
-                                    params_meta[p] = val
-                            except Exception:
-                                pass
-                if sources:
-                    prompt_hash = hash_bytes(_to_bytes({"sources": sources}))
-            except Exception:
-                prompt_hash = None
-            # Compute anchor id for alignment
-            try:
-                anchor_id2 = self._make_anchor_id(ActionType.LLM, agg_actor or "graph", labels2)
-                if anchor_id2:
-                    labels2["anchor_id"] = anchor_id2
-            except Exception:
-                pass
-
-            # Label hash provenance (aggregated vs staged)
-            if prompt_hash:
-                labels2["hash_source"] = "aggregated"
-
-            ev2 = Event(
-                run_id=self.run.run_id,
+            ev2, step2 = self._finalize_messages_aggregate(
                 step=step,
-                action_type=ActionType.LLM,
-                actor=agg_actor or "graph",
-                output_ref=out_blob2,
-                hashes=(
-                    {"output": out_blob2.sha256_hex}
-                    | ({"prompt": prompt_hash} if prompt_hash else {})
-                ),
-                labels=labels2,
-                model_meta={
-                    "adapter_version": self.ADAPTER_VERSION,
-                    "framework": "langgraph",
-                    "chunks_count": len(agg_chunks),
-                    **({"provider": provider} if provider else {}),
-                    **({"model": model} if model else {}),
-                    **params_meta,
-                },
-                ts=tw_now(),
+                agg_actor=agg_actor,
+                agg_text=agg_text,
+                agg_chunks=agg_chunks,
+                agg_labels=agg_labels,
             )
-            # Merge a staged prompt hash when not present
-            try:
-                if "prompt" not in ev2.hashes:
-                    staged = try_pop_prompt_hash()
-                    if staged:
-                        # Update label to reflect staged provenance (staged takes precedence)
-                        new_labels = dict(ev2.labels or {})
-                        new_labels["hash_source"] = "staged"
-                        ev2 = ev2.model_copy(
-                            update={
-                                "hashes": {**ev2.hashes, "prompt": staged},
-                                "labels": new_labels,
-                            }
-                        )
-            except Exception:
-                pass
             self._append_event(ev2)
-            step += 1
+            step = step2
             # reset
             agg_key = None
             agg_chunks = []
@@ -208,53 +109,14 @@ class LangGraphRecorder:
 
         for update in iterator:
             # Normalize stream shapes
-            stream_mode_label: str | None = None
-            namespace_label: str | None = None
-            upd = update
-
-            try:
-                # (namespace, mode, data)
-                if (
-                    isinstance(update, tuple | list)
-                    and len(update) == 3
-                    and isinstance(update[0], tuple | list)
-                    and isinstance(update[1], str)
-                ):
-                    ns = [str(x) for x in update[0]]
-                    namespace_label = "/".join(ns)
-                    stream_mode_label = update[1]
-                    upd = update[2]
-                # (mode, data)
-                elif (
-                    isinstance(update, tuple | list)
-                    and len(update) == 2
-                    and isinstance(update[0], str)
-                ):
-                    stream_mode_label = update[0]
-                    upd = update[1]
-                # (namespace, data)
-                elif (
-                    isinstance(update, tuple | list)
-                    and len(update) == 2
-                    and isinstance(update[0], tuple | list)
-                ):
-                    ns = [str(x) for x in update[0]]
-                    namespace_label = "/".join(ns)
-                    upd = update[1]
-                else:
-                    # single-mode guesses (values or updates)
-                    stream_mode_label = single_mode_label
-            except Exception:
-                stream_mode_label = stream_mode_label or single_mode_label
+            namespace_label, stream_mode_label, upd = self._normalize_stream_item(
+                update, single_mode_label
+            )
 
             actor = self._infer_actor(upd)
             # Derive actor from namespace if not inferred
             if actor == "graph" and namespace_label:
-                try:
-                    last_seg = namespace_label.split("|")[-1]
-                    actor = last_seg.split(":")[0] if ":" in last_seg else last_seg
-                except Exception:
-                    pass
+                actor = self._derive_actor_from_namespace(namespace_label, actor)
 
             # Special handling for messages mode: (message_chunk, metadata)
             if (
@@ -692,9 +554,12 @@ class LangGraphRecorder:
                 AsyncIterable[Any], self.graph.astream(inputs, config or {}, **stream_kwargs)
             )
         except TypeError:
-            stream_kwargs.pop("subgraphs", None)
+            # Some runtimes may not accept the 'subgraphs' kwarg. Retry without mutating
+            # the original kwargs to keep behavior consistent with the sync path.
+            stream_kwargs2 = dict(stream_kwargs)
+            stream_kwargs2.pop("subgraphs", None)
             async_iterator = cast(
-                AsyncIterable[Any], self.graph.astream(inputs, config or {}, **stream_kwargs)
+                AsyncIterable[Any], self.graph.astream(inputs, config or {}, **stream_kwargs2)
             )
 
         # Local per-run state, matching sync path
@@ -732,6 +597,7 @@ class LangGraphRecorder:
             provider: str | None = None
             model: str | None = None
             params_meta: dict[str, Any] = {}
+            _prompt_hash_failed = False
             try:
                 from ..codec import to_bytes as _to_bytes
 
@@ -762,6 +628,7 @@ class LangGraphRecorder:
                     prompt_hash = hash_bytes(_to_bytes({"sources": sources}))
             except Exception:
                 prompt_hash = None
+                _prompt_hash_failed = True
             try:
                 anchor_id2 = self._make_anchor_id(ActionType.LLM, agg_actor or "graph", labels2)
                 if anchor_id2:
@@ -785,6 +652,7 @@ class LangGraphRecorder:
                     "adapter_version": self.ADAPTER_VERSION,
                     "framework": "langgraph",
                     "chunks_count": len(agg_chunks),
+                    "prompt_hash_agg_failed": True if _prompt_hash_failed else False,
                     **({"provider": provider} if provider else {}),
                     **({"model": model} if model else {}),
                     **params_meta,
@@ -814,34 +682,9 @@ class LangGraphRecorder:
             agg_actor = None
 
         async for update in async_iterator:
-            stream_mode_label: str | None = None
-            namespace_label: str | None = None
-            upd = update
-
-            try:
-                if (
-                    isinstance(update, tuple | list)
-                    and len(update) == 3
-                    and isinstance(update[0], tuple | list)
-                    and isinstance(update[1], str)
-                ):
-                    ns = [str(x) for x in update[0]]
-                    namespace_label = "/".join(ns)
-                    stream_mode_label = update[1]
-                    upd = update[2]
-            except Exception:
-                pass
-
-            try:
-                if (
-                    isinstance(update, tuple | list)
-                    and len(update) == 2
-                    and isinstance(update[0], str)
-                ):
-                    stream_mode_label = update[0]
-                    upd = update[1]
-            except Exception:
-                pass
+            namespace_label, stream_mode_label, upd = self._normalize_stream_item(
+                update, single_mode_label
+            )
 
             # Identify actor
             actor = self._infer_actor(upd)
@@ -1399,6 +1242,181 @@ class LangGraphRecorder:
             return {"_repr": repr(x)}
 
         return {"message": to_plain(msg), "metadata": to_plain(meta)}
+
+    def _normalize_stream_item(
+        self, update: Any, single_mode_label: str | None
+    ) -> tuple[str | None, str | None, Any]:
+        """Normalize a stream update into (namespace_label, stream_mode_label, data).
+
+        Supports shapes:
+        - (namespace, mode, data)
+        - (mode, data)
+        - (namespace, data)
+        - data-only (fallback to provided single_mode_label)
+        """
+        namespace_label: str | None = None
+        stream_mode_label: str | None = None
+        upd = update
+        try:
+            if (
+                isinstance(update, tuple | list)
+                and len(update) == 3
+                and isinstance(update[0], tuple | list)
+                and isinstance(update[1], str)
+            ):
+                ns = [str(x) for x in update[0]]
+                namespace_label = "/".join(ns)
+                stream_mode_label = update[1]
+                upd = update[2]
+                return namespace_label, stream_mode_label, upd
+        except Exception:
+            pass
+        try:
+            if isinstance(update, tuple | list) and len(update) == 2 and isinstance(update[0], str):
+                stream_mode_label = update[0]
+                upd = update[1]
+                return namespace_label, stream_mode_label, upd
+        except Exception:
+            pass
+        try:
+            if (
+                isinstance(update, tuple | list)
+                and len(update) == 2
+                and isinstance(update[0], tuple | list)
+            ):
+                ns = [str(x) for x in update[0]]
+                namespace_label = "/".join(ns)
+                upd = update[1]
+                return namespace_label, stream_mode_label, upd
+        except Exception:
+            pass
+        # Fallback: best guess using single mode label
+        return namespace_label, single_mode_label, upd
+
+    def _derive_actor_from_namespace(self, namespace_label: str, actor: str) -> str:
+        """Derive a node actor name from a namespace path.
+
+        Namespace segments are '/' separated. The final segment may include a subgraph
+        instance suffix after ':'.
+        """
+        try:
+            last_seg = namespace_label.split("/")[-1]
+            return last_seg.split(":")[0] if ":" in last_seg else last_seg
+        except Exception:  # pragma: no cover - defensive
+            return actor
+
+    def _finalize_messages_aggregate(
+        self,
+        *,
+        step: int,
+        agg_actor: str | None,
+        agg_text: list[str],
+        agg_chunks: list[dict[str, Any]],
+        agg_labels: dict[str, str],
+    ) -> tuple[Event, int]:
+        """Create aggregated LLM Event for messages buffer and return (event, next_step)."""
+        # Persist chunks separately to keep main payload compact
+        chunks_payload: dict[str, Any] = {"chunks": agg_chunks}
+        chunks_b = self._normalize_bytes(chunks_payload)
+        chunks_ref = self.store.put_blob(self.run.run_id, step, BlobKind.STATE, chunks_b)
+        payload: dict[str, Any] = {
+            "message": {"content": "".join(agg_text)},
+            "metadata": {"chunks_count": len(agg_chunks)},
+            "chunks_ref": chunks_ref.model_dump(mode="json"),
+        }
+        payload_b2 = self._normalize_bytes(payload)
+        out_blob2 = self.store.put_blob(self.run.run_id, step, BlobKind.OUTPUT, payload_b2)
+        labels2 = dict(agg_labels)
+        labels2["stream_mode"] = "messages"
+        if agg_actor:
+            labels2.setdefault("node", agg_actor)
+
+        # Best-effort extraction for prompt hash, provider/model/params
+        prompt_hash: str | None = None
+        provider: str | None = None
+        model: str | None = None
+        params_meta: dict[str, Any] = {}
+        _prompt_hash_failed = False
+        try:
+            from ..codec import to_bytes as _to_bytes
+
+            sources: list[Any] = []
+            for ch in agg_chunks:
+                meta = ch.get("metadata") if isinstance(ch, dict) else None
+                if not isinstance(meta, dict):
+                    continue
+                for key in ("llm_input_messages", "input_messages", "messages", "prompt"):
+                    if key in meta:
+                        sources.append(meta[key])
+                if provider is None and isinstance(meta.get("provider"), str):
+                    provider = str(meta.get("provider"))
+                if model is None and isinstance(meta.get("model"), str):
+                    model = str(meta.get("model"))
+                for p in ("temperature", "top_p", "tool_choice"):
+                    val = meta.get(p)
+                    if val is None and isinstance(meta.get("params"), dict):
+                        params = meta["params"]
+                        try:
+                            val = params.get(p)
+                        except Exception:
+                            val = None
+                    if val is not None and p not in params_meta:
+                        if isinstance(val, str | int | float | bool):
+                            params_meta[p] = val
+            if sources:
+                prompt_hash = hash_bytes(_to_bytes({"sources": sources}))
+        except Exception:
+            prompt_hash = None
+            _prompt_hash_failed = True
+
+        # Anchor id
+        try:
+            anchor_id2 = self._make_anchor_id(ActionType.LLM, agg_actor or "graph", labels2)
+            if anchor_id2:
+                labels2["anchor_id"] = anchor_id2
+        except Exception:
+            pass
+
+        if prompt_hash:
+            labels2["hash_source"] = "aggregated"
+
+        ev2 = Event(
+            run_id=self.run.run_id,
+            step=step,
+            action_type=ActionType.LLM,
+            actor=agg_actor or "graph",
+            output_ref=out_blob2,
+            hashes=(
+                {"output": out_blob2.sha256_hex} | ({"prompt": prompt_hash} if prompt_hash else {})
+            ),
+            labels=labels2,
+            model_meta={
+                "adapter_version": self.ADAPTER_VERSION,
+                "framework": "langgraph",
+                "chunks_count": len(agg_chunks),
+                "prompt_hash_agg_failed": True if _prompt_hash_failed else False,
+                **({"provider": provider} if provider else {}),
+                **({"model": model} if model else {}),
+                **params_meta,
+            },
+            ts=tw_now(),
+        )
+        # Merge a staged prompt hash when not present
+        try:
+            if "prompt" not in ev2.hashes:
+                staged = try_pop_prompt_hash()
+                if staged:
+                    new_labels = dict(ev2.labels or {})
+                    new_labels["hash_source"] = "staged"
+                    ev2 = ev2.model_copy(
+                        update={
+                            "hashes": {**ev2.hashes, "prompt": staged},
+                            "labels": new_labels,
+                        }
+                    )
+        except Exception:
+            pass
+        return ev2, step + 1
 
     def _infer_actor(self, update: Any) -> str:
         # Best-effort extraction of node name from LangGraph update dicts

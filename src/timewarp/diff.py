@@ -8,7 +8,7 @@ from uuid import UUID
 from deepdiff import DeepDiff
 
 from .codec import from_bytes
-from .events import Event
+from .events import Event, redact
 from .store import LocalStore
 
 
@@ -39,6 +39,16 @@ def make_anchor_key(ev: Event) -> tuple[Any, Any] | tuple[Any, Any, Any, Any, An
     except Exception:
         p_hash = None
     return (ev.action_type, ev.actor, ns, tid, p_hash)
+
+
+def _first_adapter_version(evs: list[Event]) -> str | None:
+    """Return the first non-empty adapter_version observed in model_meta."""
+    for e in evs:
+        mm = e.model_meta or {}
+        v = mm.get("adapter_version") if isinstance(mm, dict) else None
+        if isinstance(v, str):
+            return v
+    return None
 
 
 def realign_by_anchor(
@@ -77,23 +87,22 @@ def first_divergence(
     evs_a = store.list_events(run_a)
     evs_b = store.list_events(run_b)
 
-    # Early schema/adaptor checks
+    # Early schema/adapter checks
     if evs_a and evs_b and evs_a[0].schema_version != evs_b[0].schema_version:
-        reason = f"schema_version mismatch: A={evs_a[0].schema_version} B={evs_b[0].schema_version}"
+        reason = (
+            "adapter/schema mismatch: schema_version mismatch: "
+            f"A={evs_a[0].schema_version} B={evs_b[0].schema_version}"
+        )
         return Divergence(evs_a[0].step, evs_b[0].step, reason=reason)
 
-    def first_adapter_version(evs: list[Event]) -> str | None:
-        for e in evs:
-            mm = e.model_meta or {}
-            v = mm.get("adapter_version") if isinstance(mm, dict) else None
-            if isinstance(v, str):
-                return v
-        return None
-
-    av_a = first_adapter_version(evs_a)
-    av_b = first_adapter_version(evs_b)
+    av_a = _first_adapter_version(evs_a)
+    av_b = _first_adapter_version(evs_b)
     if av_a and av_b and av_a != av_b:
-        return Divergence(0, 0, reason=f"adapter_version mismatch: A={av_a} B={av_b}")
+        return Divergence(
+            0,
+            0,
+            reason=f"adapter/schema mismatch: adapter_version mismatch: A={av_a} B={av_b}",
+        )
 
     def out_hash(ev: Event) -> str | None:
         if ev.hashes and "output" in ev.hashes:
@@ -123,7 +132,7 @@ def first_divergence(
                     j = match_j if match_j is not None else j
                 continue
             # No anchor alignment within window: actor/type mismatch is a real divergence
-            return Divergence(a.step, b.step, reason="action_type/actor mismatch (unanchored)")
+            return Divergence(a.step, b.step, reason="anchor mismatch")
 
         # Anchors aligned; compare hashes
         if out_hash(a) != out_hash(b):
@@ -131,8 +140,8 @@ def first_divergence(
             text = None
             struct = None
             try:
-                pa = _load_output(store, a)
-                pb = _load_output(store, b)
+                pa = _load_redacted_output(store, a, b)
+                pb = _load_redacted_output(store, b, a)
                 if isinstance(pa, dict | list) and isinstance(pb, dict | list):
                     dd = DeepDiff(pa, pb, ignore_order=False)
                     struct = dict(dd)
@@ -151,11 +160,12 @@ def first_divergence(
         j += 1
 
     if len(evs_a) != len(evs_b):
-        # One run has extra trailing events
-        longer, which = (evs_a, "A") if len(evs_a) > len(evs_b) else (evs_b, "B")
+        # One run has extra trailing events; report as anchor mismatch
+        # to align with the bisect cause taxonomy.
+        longer = evs_a if len(evs_a) > len(evs_b) else evs_b
         last_idx = min(len(evs_a), len(evs_b))
         last = longer[last_idx]
-        return Divergence(last.step, last.step, reason=f"length mismatch: {which} longer")
+        return Divergence(last.step, last.step, reason="anchor mismatch")
 
     return None
 
@@ -165,6 +175,23 @@ def _load_output(store: LocalStore, ev: Event) -> Any:
         data = store.get_blob(ev.output_ref)
         return from_bytes(data)
     return None
+
+
+def _load_redacted_output(store: LocalStore, ev: Event, other: Event | None = None) -> Any:
+    obj = _load_output(store, ev)
+    try:
+        marks: dict[str, str] = {}
+        if getattr(ev, "privacy_marks", None):
+            marks.update(ev.privacy_marks)
+        if other is not None and getattr(other, "privacy_marks", None):
+            # Union privacy marks from both sides to be conservative
+            marks.update(other.privacy_marks)
+        if (marks and isinstance(obj, dict | list | str | int | float | bool)) or obj is None:
+            # redact expects JSON-serializable structures; non-serializable fall back untouched
+            return redact(obj, marks)
+    except Exception:
+        pass
+    return obj
 
 
 def _to_text(obj: Any) -> str:
@@ -205,16 +232,8 @@ def bisect_divergence(
             "cause": "adapter/schema mismatch",
         }
 
-    def first_adapter_version(evs: list[Event]) -> str | None:
-        for e in evs:
-            mm = e.model_meta or {}
-            v = mm.get("adapter_version") if isinstance(mm, dict) else None
-            if isinstance(v, str):
-                return v
-        return None
-
-    av_a = first_adapter_version(evs_a)
-    av_b = first_adapter_version(evs_b)
+    av_a = _first_adapter_version(evs_a)
+    av_b = _first_adapter_version(evs_b)
     if av_a and av_b and av_a != av_b:
         return {
             "start_a": 0,
