@@ -534,18 +534,22 @@ def main(argv: list[str] | None = None) -> int:
 
         from collections.abc import Callable
 
-        from timewarp.replay import PlaybackLLM, PlaybackTool  # local import for typing
+        from timewarp.replay import (  # local import for typing
+            PlaybackLLM,
+            PlaybackMemory,
+            PlaybackTool,
+        )
 
         teardowns: list[Callable[[], None]] = []
 
-        def installer_inject(llm: PlaybackLLM, tool: PlaybackTool) -> None:
+        def installer_inject(llm: PlaybackLLM, tool: PlaybackTool, memory: PlaybackMemory) -> None:
             try:
                 try:
                     llm.strict_meta = bool(args.strict_meta)
                     tool.strict_meta = bool(args.strict_meta)
                 except Exception:
                     pass
-                td = _installers.bind_langgraph_playback(graph, llm, tool)
+                td = _installers.bind_langgraph_playback(graph, llm, tool, memory)
                 # retain teardown in outer scope
                 teardowns.append(td)
             except Exception as exc:  # pragma: no cover

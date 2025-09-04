@@ -511,7 +511,7 @@ class LangGraphReplayer:
         replacement: Any,
         thread_id: str | None,
         *,
-        install_wrappers: Callable[[PlaybackLLM, PlaybackTool], None] | None = None,
+        install_wrappers: Callable[..., None] | None = None,
         freeze_time: bool = False,
     ) -> UUID:
         """Prepare a forked run by installing an override for a single LLM/TOOL event.
@@ -539,9 +539,32 @@ class LangGraphReplayer:
             override={at_step: replacement},
             freeze_time=freeze_time,
         )
+        # Build playback memory wrapper for recorded retrieval events (for provider patching)
+        mem_cursor = _EventCursor(
+            events=events, action_type=ActionType.RETRIEVAL, start_index=0, thread_id=thread_id
+        )
+        memory = PlaybackMemory(store=self.store, retrieval_cursor=mem_cursor)
+        memory.freeze_time = freeze_time
         if install_wrappers is None:
             raise AdapterInvariant("install_wrappers is required to bind overrides for forking")
-        install_wrappers(llm, tool)
+        # Backward-compatible: support installers that accept (llm, tool) or (llm, tool, memory)
+        try:
+            import inspect as _inspect
+
+            n_params = len(_inspect.signature(install_wrappers).parameters)
+        except Exception:
+            n_params = 2
+        try:
+            if n_params >= 3:
+                install_wrappers(llm, tool, memory)
+            else:
+                install_wrappers(llm, tool)
+        except TypeError:
+            # Fallback if arity detection failed
+            try:
+                install_wrappers(llm, tool)
+            except Exception:
+                raise
         # Create a forked Run with branch metadata for discoverability.
         # Attempt to copy basic metadata from the original Run.
         try:
