@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .adapters.installers import bind_langgraph_record
+from .adapters.installers import bind_langgraph_record, bind_memory_taps
 from .adapters.langgraph import LangGraphRecorder
 from .determinism import now as tw_now
 from .events import Run
@@ -36,6 +36,7 @@ class RecorderHandle:
     stream_subgraphs: bool
     require_thread_id: bool
     enable_record_taps: bool
+    enable_memory_taps: bool
     event_batch_size: int = 20
 
     last_run_id: Any | None = None
@@ -49,6 +50,7 @@ class RecorderHandle:
             started_at=tw_now(),
         )
         teardown: Any | None = None
+        teardown_mem: Any | None = None
         recorder = LangGraphRecorder(
             graph=self.graph,
             store=self.store,
@@ -66,11 +68,18 @@ class RecorderHandle:
         try:
             if self.enable_record_taps:
                 teardown = bind_langgraph_record()
+            if self.enable_memory_taps:
+                teardown_mem = bind_memory_taps()
             result = recorder.invoke(inputs, config=config or {})
         finally:
             if callable(teardown):
                 try:
                     teardown()
+                except Exception:
+                    pass
+            if callable(teardown_mem):
+                try:
+                    teardown_mem()
                 except Exception:
                     pass
         self.last_run_id = run.run_id
@@ -85,6 +94,7 @@ class RecorderHandle:
             started_at=tw_now(),
         )
         teardown: Any | None = None
+        teardown_mem: Any | None = None
         recorder = LangGraphRecorder(
             graph=self.graph,
             store=self.store,
@@ -102,6 +112,8 @@ class RecorderHandle:
         try:
             if self.enable_record_taps:
                 teardown = bind_langgraph_record()
+            if self.enable_memory_taps:
+                teardown_mem = bind_memory_taps()
             # Prefer native async recording
             result = await recorder.ainvoke(inputs, config=config or {})
         finally:
@@ -109,6 +121,11 @@ class RecorderHandle:
                 try:
                     # Teardown is currently sync best-effort; run it in a thread to avoid blocking
                     await asyncio.to_thread(teardown)
+                except Exception:
+                    pass
+            if callable(teardown_mem):
+                try:
+                    await asyncio.to_thread(teardown_mem)
                 except Exception:
                     pass
         self.last_run_id = run.run_id
@@ -131,6 +148,7 @@ def wrap(
     stream_subgraphs: bool = True,
     require_thread_id: bool = False,
     enable_record_taps: bool = True,
+    enable_memory_taps: bool = True,
     event_batch_size: int = 20,
 ) -> RecorderHandle:
     """Wrap a compiled LangGraph with a recorder facade.
@@ -185,5 +203,6 @@ def wrap(
         stream_subgraphs=bool(stream_subgraphs),
         require_thread_id=bool(require_thread_id),
         enable_record_taps=bool(eff_enable_taps),
+        enable_memory_taps=bool(enable_memory_taps),
         event_batch_size=int(event_batch_size),
     )

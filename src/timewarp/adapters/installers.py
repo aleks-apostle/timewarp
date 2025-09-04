@@ -18,11 +18,12 @@ from typing import Any
 
 from ..codec import to_bytes
 from ..events import hash_bytes
-from ..replay import PlaybackLLM, PlaybackTool
+from ..replay import PlaybackLLM, PlaybackMemory, PlaybackTool
 
 # --- Staging queues for record-time taps (process-local, FIFO) ---
 _STAGED_PROMPTS: deque[str] = deque()
 _STAGED_TOOLARGS: deque[str] = deque()
+_STAGED_MEMTAPS: deque[dict[str, Any]] = deque()
 
 
 def stage_prompt_hash(h: str) -> None:
@@ -47,13 +48,16 @@ def try_pop_tool_args_hash() -> str | None:
         return None
 
 
-def bind_langgraph_playback(graph: Any, llm: PlaybackLLM, tool: PlaybackTool) -> Callable[[], None]:
+def bind_langgraph_playback(
+    graph: Any, llm: PlaybackLLM, tool: PlaybackTool, memory: PlaybackMemory | None = None
+) -> Callable[[], None]:
     """Bind playback wrappers to common integration points.
 
     Parameters
     - graph: compiled LangGraph (unused for now; reserved for future binding)
     - llm: PlaybackLLM instance constructed by the replayer
     - tool: PlaybackTool instance constructed by the replayer
+    - memory: Optional PlaybackMemory for provider memory/retriever patching
 
     Returns
     - teardown() callable that restores any monkeypatched methods.
@@ -140,6 +144,77 @@ def bind_langgraph_playback(graph: Any, llm: PlaybackLLM, tool: PlaybackTool) ->
                 pass
 
         teardowns.append(_undo_tool)
+
+    # --- Optional: patch common memory providers to route to PlaybackMemory ---
+    if memory is not None:
+        import importlib
+
+        # Mem0 patchers
+        try:  # pragma: no cover - optional dependency
+            mem0_mod = importlib.import_module("mem0")
+            cand = getattr(mem0_mod, "Memory", None) or getattr(mem0_mod, "Client", None)
+            if cand is not None:
+                cls = cand
+
+                def _patch_mem0_method(name: str) -> Callable[[], None] | None:
+                    if not hasattr(cls, name):
+                        return None
+                    orig = getattr(cls, name)
+                    if not callable(orig):
+                        return None
+
+                    def _patched(self: Any, *args: Any, **kwargs: Any) -> Any:
+                        # Do not call the original to avoid side-effects / network
+                        if name in ("search", "retrieve", "query"):
+                            q = args[0] if args else kwargs.get("query")
+                            tk = kwargs.get("top_k")
+                            return memory.retrieve(q, retriever="mem0", top_k=tk)
+                        if name in ("save", "add", "delete", "update"):
+                            # Best-effort: no-op and return a benign value
+                            return None
+                        # Fallback
+                        return None
+
+                    setattr(cls, name, _patched)
+
+                    def _undo() -> None:
+                        try:
+                            setattr(cls, name, orig)
+                        except Exception:
+                            pass
+
+                    return _undo
+
+                for m in ("search", "retrieve", "query", "save", "add", "delete", "update"):
+                    undo = _patch_mem0_method(m)
+                    if undo is not None:
+                        teardowns.append(undo)
+        except Exception:
+            pass
+
+        # LlamaIndex retriever patch (best-effort)
+        try:  # pragma: no cover - optional dependency
+            li_mod = importlib.import_module("llama_index")
+            RetrieverBase = getattr(li_mod, "BaseRetriever", None)
+            if RetrieverBase is not None and hasattr(RetrieverBase, "retrieve"):
+                orig_ret = RetrieverBase.retrieve
+
+                def _patched_retrieve(self: Any, *args: Any, **kwargs: Any) -> Any:
+                    q = args[0] if args else kwargs.get("query")
+                    items = memory.retrieve(q, retriever="llamaindex")
+                    return items
+
+                RetrieverBase.retrieve = _patched_retrieve
+
+                def _undo_li() -> None:
+                    try:
+                        RetrieverBase.retrieve = orig_ret
+                    except Exception:
+                        pass
+
+                teardowns.append(_undo_li)
+        except Exception:
+            pass
 
     # Compose teardowns
     def teardown() -> None:
@@ -271,3 +346,188 @@ def _extract_model_meta(model_obj: Any) -> dict[str, Any]:
     except Exception:
         return out
     return out
+
+
+# --- Provider memory taps (record mode) ---
+
+
+def stage_memory_tap(env: dict[str, Any]) -> None:
+    """Stage a normalized provider-tap envelope for persistence by the recorder.
+
+    Expected shapes (minimal):
+    - MEMORY write: {"kind": "MEMORY", "mem_provider": str, "mem_op": str,
+                     "key": str, "value": Any, "mem_scope"?: str, "mem_space"?: str}
+    - RETRIEVAL read: {"kind": "RETRIEVAL", "mem_provider": str, "query": Any,
+                       "items": list[dict], "policy": {"retriever"?: str, "top_k"?: int},
+                       "query_id"?: str}
+    Unknown shapes are ignored.
+    """
+    try:
+        kind = env.get("kind")
+        if kind not in ("MEMORY", "RETRIEVAL"):
+            return
+        # Store a shallow copy to avoid caller mutation after staging
+        _STAGED_MEMTAPS.append(dict(env))
+    except Exception:
+        # best-effort
+        return
+
+
+def try_pop_memory_taps(max_items: int = 1000) -> list[dict[str, Any]]:
+    """Drain staged provider-tap envelopes (FIFO).
+
+    Recorder will call this after each update to persist provider-origin events
+    alongside core events, preserving causality in step ordering.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        n = 0
+        while _STAGED_MEMTAPS and n < max_items:
+            out.append(_STAGED_MEMTAPS.popleft())
+            n += 1
+    except Exception:
+        # Leave remaining items for next pass
+        pass
+    return out
+
+
+def bind_memory_taps() -> Callable[[], None]:
+    """Best-effort patchers for common memory providers to stage MEMORY/RETRIEVAL taps.
+
+    This scaffolding intentionally no-ops when optional dependencies are not present.
+    Concrete Mem0 and LlamaIndex patchers can be added incrementally.
+    """
+    teardowns: list[Callable[[], None]] = []
+
+    import importlib
+
+    # --- Mem0 (optional) ---
+    try:  # pragma: no cover - optional dependency
+        mem0_mod = importlib.import_module("mem0")
+        # Heuristic: detect a Memory-like class with save/search/delete
+        cand = getattr(mem0_mod, "Memory", None) or getattr(mem0_mod, "Client", None)
+        if cand is not None:
+            cls = cand
+
+            # Wrap instance methods if present
+            def _patch_method(
+                name: str, wrapper: Callable[[Any, Any, Any], Any]
+            ) -> Callable[[], None] | None:
+                if not hasattr(cls, name):
+                    return None
+                orig = getattr(cls, name)
+                if not callable(orig):
+                    return None
+
+                def _patched(self: Any, *args: Any, **kwargs: Any) -> Any:
+                    res = orig(self, *args, **kwargs)
+                    try:
+                        if name in ("save", "add"):
+                            stage_memory_tap(
+                                {
+                                    "kind": "MEMORY",
+                                    "mem_provider": "Mem0",
+                                    "mem_op": "PUT",
+                                    "key": kwargs.get("key") or "mem0",
+                                    "value": args[0] if args else kwargs.get("item"),
+                                }
+                            )
+                        elif name in ("delete",):
+                            stage_memory_tap(
+                                {
+                                    "kind": "MEMORY",
+                                    "mem_provider": "Mem0",
+                                    "mem_op": "DELETE",
+                                    "key": kwargs.get("key") or "mem0",
+                                    "value": None,
+                                }
+                            )
+                        elif name in ("search", "retrieve", "query"):
+                            q = args[0] if args else kwargs.get("query")
+                            items = res if isinstance(res, list) else []
+                            stage_memory_tap(
+                                {
+                                    "kind": "RETRIEVAL",
+                                    "mem_provider": "Mem0",
+                                    "query": q,
+                                    "items": items,
+                                    "policy": {
+                                        "retriever": "vector",
+                                        "top_k": kwargs.get("top_k"),
+                                    },
+                                }
+                            )
+                    except Exception:
+                        pass
+                    return res
+
+                setattr(cls, name, _patched)
+
+                def _undo() -> None:
+                    try:
+                        setattr(cls, name, orig)
+                    except Exception:
+                        pass
+
+                return _undo
+
+            for m in ("save", "add", "delete", "search", "retrieve", "query"):
+                undo = _patch_method(m, lambda self, *a, **k: None)  # wrapper unused
+                if undo is not None:
+                    teardowns.append(undo)
+    except Exception:
+        pass
+
+    # --- LlamaIndex (optional) ---
+    try:  # pragma: no cover - optional dependency
+        li_mod = importlib.import_module("llama_index")
+        # Patch common retriever base class if present
+        RetrieverBase = getattr(li_mod, "BaseRetriever", None)
+        if RetrieverBase is not None and hasattr(RetrieverBase, "retrieve"):
+            orig_ret = RetrieverBase.retrieve
+
+            def _patched_retrieve(self: Any, *args: Any, **kwargs: Any) -> Any:
+                res = orig_ret(self, *args, **kwargs)
+                try:
+                    q = args[0] if args else kwargs.get("query")
+                    items = (
+                        [
+                            (xi.dict() if hasattr(xi, "dict") and callable(xi.dict) else xi)
+                            for xi in res
+                        ]
+                        if isinstance(res, list)
+                        else []
+                    )
+                    stage_memory_tap(
+                        {
+                            "kind": "RETRIEVAL",
+                            "mem_provider": "LlamaIndex",
+                            "query": q,
+                            "items": items,
+                            "policy": {"retriever": "llamaindex"},
+                        }
+                    )
+                except Exception:
+                    pass
+                return res
+
+            RetrieverBase.retrieve = _patched_retrieve
+
+            def _undo_li() -> None:
+                try:
+                    RetrieverBase.retrieve = orig_ret
+                except Exception:
+                    pass
+
+            teardowns.append(_undo_li)
+    except Exception:
+        pass
+
+    def teardown() -> None:
+        for f in reversed(teardowns):
+            try:
+                f()
+            except Exception:
+                continue
+
+    return teardown
