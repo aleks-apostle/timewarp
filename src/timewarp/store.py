@@ -195,6 +195,15 @@ class LocalStore:
                     ev_to_store = ev.model_copy(update={"model_meta": meta})
                 except Exception:
                     ev_to_store = ev
+            # Ensure referenced blobs are finalized on disk before inserting event
+            try:
+                if ev_to_store.input_ref is not None:
+                    self._finalize_blob_file(ev_to_store.input_ref)
+                if ev_to_store.output_ref is not None:
+                    self._finalize_blob_file(ev_to_store.output_ref)
+            except Exception:
+                # propagate after closing span context to avoid masking tracing
+                raise
             with self._conn() as con:
                 con.execute(
                     """
@@ -262,6 +271,11 @@ class LocalStore:
                             ev_to_store = ev.model_copy(update={"model_meta": meta})
                         except Exception:
                             ev_to_store = ev
+                    # Ensure referenced blobs are finalized on disk before inserting event
+                    if ev_to_store.input_ref is not None:
+                        self._finalize_blob_file(ev_to_store.input_ref)
+                    if ev_to_store.output_ref is not None:
+                        self._finalize_blob_file(ev_to_store.output_ref)
                     con.execute(
                         """
                     INSERT INTO events (
@@ -390,6 +404,93 @@ class LocalStore:
             )
         return events
 
+    def list_events_window(self, run_id: UUID, offset: int, limit: int) -> list[Event]:
+        """Return a window of events ordered by step (offset/limit).
+
+        Does not load the full run into memory. Useful for paging in CLIs.
+        """
+        off = max(0, int(offset))
+        lim = max(1, int(limit))
+        with self._conn() as con:
+            cur = con.execute(
+                (
+                    "SELECT run_id, step, action_type, actor, input_ref, output_ref, ts, "
+                    "rng_state, model_meta, hashes, parent_step, labels, privacy_marks, "
+                    "schema_version, tool_kind, tool_name, mcp_server, mcp_transport, "
+                    "tools_digest, mem_op, mem_scope, mem_space, mem_provider, query_id, "
+                    "retriever, top_k FROM events WHERE run_id=? ORDER BY step ASC LIMIT ? OFFSET ?"
+                ),
+                (str(run_id), lim, off),
+            )
+            rows = cur.fetchall()
+        events: list[Event] = []
+        for r in rows:
+            (
+                run_id_s,
+                step,
+                action_type,
+                actor,
+                input_ref,
+                output_ref,
+                ts,
+                rng_state,
+                model_meta,
+                hashes,
+                parent_step,
+                labels,
+                privacy_marks,
+                schema_version,
+                tool_kind,
+                tool_name,
+                mcp_server,
+                mcp_transport,
+                tools_digest,
+                mem_op,
+                mem_scope,
+                mem_space,
+                mem_provider,
+                query_id,
+                retriever,
+                top_k,
+            ) = r
+
+            def parse_blob(s: str | None) -> BlobRef | None:
+                if not s:
+                    return None
+                return BlobRef.model_validate_json(s)
+
+            events.append(
+                Event(
+                    run_id=UUID(run_id_s),
+                    step=step,
+                    action_type=action_type,
+                    actor=actor,
+                    input_ref=parse_blob(input_ref),
+                    output_ref=parse_blob(output_ref),
+                    ts=datetime_from_iso(ts),
+                    rng_state=rng_state,
+                    model_meta=json.loads(model_meta) if model_meta else None,
+                    hashes=json.loads(hashes) if hashes else {},
+                    parent_step=parent_step,
+                    labels=json.loads(labels) if labels else {},
+                    privacy_marks=json.loads(privacy_marks) if privacy_marks else {},
+                    schema_version=schema_version,
+                    tool_kind=tool_kind,
+                    tool_name=tool_name,
+                    mcp_server=mcp_server,
+                    mcp_transport=mcp_transport,
+                    tools_digest=tools_digest,
+                    mem_op=mem_op,
+                    mem_scope=mem_scope,
+                    mem_space=mem_space,
+                    mem_provider=mem_provider,
+                    query_id=query_id,
+                    retriever=retriever,
+                    top_k=top_k,
+                )
+            )
+        return events
+
     def count_events(self, run_id: UUID) -> int:
         with self._conn() as con:
             cur = con.execute("SELECT COUNT(*) FROM events WHERE run_id = ?", (str(run_id),))
@@ -421,8 +522,10 @@ class LocalStore:
         dir_path = self.blobs_root / rel_dir
         dir_path.mkdir(parents=True, exist_ok=True)
         filename = f"{kind.value}.bin"
+        tmp_path = dir_path / (filename + ".tmp")
         data = zstd_compress(payload) if compress else payload
-        (dir_path / filename).write_bytes(data)
+        # Write to a temp file first; finalize during event append
+        tmp_path.write_bytes(data)
         return BlobRef(
             run_id=run_id,
             step=step,
@@ -435,10 +538,30 @@ class LocalStore:
         )
 
     def get_blob(self, ref: BlobRef) -> bytes:
+        # Attempt lazy finalization: if final file missing but tmp exists, rename now
+        self._finalize_blob_file(ref)
         data = (self.blobs_root / ref.path).read_bytes()
         if ref.compression == "zstd":
             return zstd_decompress(data)
         return data
+
+    # --- blob finalization helpers ---
+
+    def _finalize_blob_file(self, ref: BlobRef) -> None:
+        """Ensure the blob file exists at its final path; rename from .tmp if present.
+
+        Raises FileNotFoundError if both final and temp files are missing.
+        """
+        final_path = self.blobs_root / ref.path
+        if final_path.exists():
+            return
+        tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
+        # If a tmp file exists, atomically move into place
+        if tmp_path.exists():
+            tmp_path.replace(final_path)
+            return
+        # Nothing to finalize; report missing file
+        raise FileNotFoundError(str(final_path))
 
 
 def datetime_from_iso(s: str) -> datetime:

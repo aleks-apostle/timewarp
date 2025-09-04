@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from uuid import UUID
 
 from .diff import bisect_divergence, first_divergence
-from .events import ActionType, BlobRef, Event
+from .events import ActionType, BlobRef, Event, redact
 from .replay import Replay, ReplayError
 from .store import LocalStore
 
@@ -32,7 +33,18 @@ def main(argv: list[str] | None = None) -> int:
         "--tool-kind", dest="tool_kind", default=None, help="Filter by tool_kind (e.g., MCP)"
     )
     evp.add_argument("--tool-name", dest="tool_name", default=None, help="Filter by tool_name")
+    evp.add_argument("--offset", type=int, default=0, help="Pagination offset")
+    evp.add_argument("--limit", type=int, default=1000000, help="Pagination limit")
     evp.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON output")
+
+    # tools: show available tools per LLM and called tools around it
+    tlsp = sub.add_parser(
+        "tools",
+        help="Show available tools (per LLM) and called tools",
+    )
+    tlsp.add_argument("run_id", help="Run ID to inspect")
+    tlsp.add_argument("--step", dest="step", type=int, default=None, help="LLM step to detail")
+    tlsp.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON output")
 
     dbg = sub.add_parser("debug")
     dbg.add_argument("run_id", help="Run ID")
@@ -168,9 +180,9 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
             try:
-                import orjson as _orjson
+                from .utils import json as _json_utils
 
-                print(_orjson.dumps(rows).decode("utf-8"))
+                print(_json_utils.dumps(rows).decode("utf-8"))
             except Exception:
                 import json as _json
 
@@ -246,9 +258,13 @@ def main(argv: list[str] | None = None) -> int:
             tool_kind=(str(args.tool_kind) if getattr(args, "tool_kind", None) else None),
             tool_name=(str(args.tool_name) if getattr(args, "tool_name", None) else None),
         )
+        # Apply paging to reduce memory/printing pressure for large runs
+        off = max(0, int(getattr(args, "offset", 0)))
+        lim = max(1, int(getattr(args, "limit", 1000000)))
+        filtered = filtered[off : off + lim]
         if getattr(args, "as_json", False):
             try:
-                import orjson as _orjson
+                from .utils import json as _json_utils
 
                 rows = [
                     {
@@ -259,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
                     }
                     for e in filtered
                 ]
-                print(_orjson.dumps(rows).decode("utf-8"))
+                print(_json_utils.dumps(rows).decode("utf-8"))
             except Exception:
                 import json as _json
 
@@ -292,6 +308,122 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{e.step:4d} {e.action_type.value:8s} {e.actor:10s} {e.labels}")
         return 0
 
+    if args.cmd == "fsck":
+        run_id = UUID(args.run_id)
+        events = store.list_events(run_id)
+        # Gather referenced blob relative paths
+        referenced: set[str] = set()
+        for e in events:
+            if e.input_ref:
+                referenced.add(e.input_ref.path)
+            if e.output_ref:
+                referenced.add(e.output_ref.path)
+        # Verify and optionally repair
+        missing: list[str] = []
+        repaired: list[str] = []
+        for rel in sorted(referenced):
+            final_path = Path(args.blobs) / rel
+            if final_path.exists():
+                continue
+            tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
+            if tmp_path.exists() and bool(getattr(args, "repair", False)):
+                try:
+                    tmp_path.replace(final_path)
+                    repaired.append(str(rel))
+                    continue
+                except Exception:
+                    pass
+            missing.append(str(rel))
+        # Optionally gc-orphans: files on disk not referenced
+        orphans: list[str] = []
+        if bool(getattr(args, "gc_orphans", False)):
+            try:
+                all_files: list[Path] = []
+                root = Path(args.blobs)
+                for path_item in root.rglob("*.bin"):
+                    all_files.append(path_item)
+                for path_item in root.rglob("*.bin.tmp"):
+                    all_files.append(path_item)
+                ref_abs = {str(Path(args.blobs) / r) for r in referenced}
+                # Exclude repaired final files
+                ref_abs.update({str(Path(args.blobs) / r) for r in repaired})
+                for path_item in all_files:
+                    if str(path_item) not in ref_abs:
+                        orphans.append(str(path_item.relative_to(root)))
+                        try:
+                            os.remove(path_item)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        # Print summary JSON for easy consumption
+        try:
+            from .utils import json as _json_utils
+
+            print(
+                _json_utils.dumps(
+                    {
+                        "missing": missing,
+                        "repaired": repaired,
+                        "orphans_gc": orphans,
+                    }
+                ).decode("utf-8")
+            )
+        except Exception:
+            import json as _json
+
+            print(
+                _json.dumps(
+                    {
+                        "missing": missing,
+                        "repaired": repaired,
+                        "orphans_gc": orphans,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        # Non-zero exit when there are unresolved missing files
+        return 1 if missing else 0
+
+    if args.cmd == "tools":
+        events = store.list_events(UUID(args.run_id))
+        # Detail view for a specific LLM step
+        if getattr(args, "step", None) is not None:
+            step = int(args.step)
+            llm: Event | None = next(
+                (e for e in events if e.step == step and e.action_type is ActionType.LLM), None
+            )
+            if llm is None:
+                print("No LLM event at the specified step")
+                return 1
+            result = _build_tools_detail(store, events, llm)
+            if bool(getattr(args, "as_json", False)):
+                try:
+                    from .utils import json as _json_utils
+
+                    print(_json_utils.dumps(result).decode("utf-8"))
+                except Exception:
+                    import json as _json
+
+                    print(_json.dumps(result, ensure_ascii=False))
+                return 0
+            _print_tools_detail(result)
+            return 0
+        # Summary across LLM steps
+        rows = _build_tools_summary(store, events)
+        if bool(getattr(args, "as_json", False)):
+            try:
+                from .utils import json as _json_utils
+
+                print(_json_utils.dumps(rows).decode("utf-8"))
+            except Exception:
+                import json as _json
+
+                print(_json.dumps(rows, ensure_ascii=False))
+            return 0
+        _print_tools_summary(rows)
+        return 0
+
     if args.cmd == "diff":
         use_bisect = bool(getattr(args, "use_bisect", False))
         if use_bisect:
@@ -301,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     from typing import Any, cast
 
-                    import orjson as _orjson
+                    from .utils import json as _json_utils
 
                     payload: object
                     if b is None:
@@ -315,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
                                 exit_code = 1
                         except Exception:
                             pass
-                    print(_orjson.dumps(payload).decode("utf-8"))
+                    print(_json_utils.dumps(payload).decode("utf-8"))
                 except Exception:
                     import json as _json
                     from typing import Any, cast
@@ -352,7 +484,7 @@ def main(argv: list[str] | None = None) -> int:
         if getattr(args, "as_json", False):
             exit_code = 0
             try:
-                import orjson as _orjson
+                from .utils import json as _json_utils
 
                 diff_payload: dict[str, object]
                 if d is None:
@@ -370,7 +502,7 @@ def main(argv: list[str] | None = None) -> int:
                             exit_code = 1
                     except Exception:
                         pass
-                print(_orjson.dumps(diff_payload).decode("utf-8"))
+                print(_json_utils.dumps(diff_payload).decode("utf-8"))
             except Exception:
                 import json as _json
 
@@ -415,8 +547,6 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 from uuid import UUID as _UUID
 
-                import orjson as _orjson
-
                 from timewarp.exporters.langsmith import serialize_run as _serialize_run
             except Exception as exc:  # pragma: no cover - dependency/import errors
                 print("Export failed: missing dependencies:", exc)
@@ -425,7 +555,9 @@ def main(argv: list[str] | None = None) -> int:
                 store, _UUID(args.run_id), include_blobs=bool(getattr(args, "include_blobs", False))
             )
             try:
-                print(_orjson.dumps(payload).decode("utf-8"))
+                from .utils import json as _json_utils
+
+                print(_json_utils.dumps(payload).decode("utf-8"))
             except Exception:
                 import json as _json
 
@@ -479,9 +611,9 @@ def main(argv: list[str] | None = None) -> int:
         print("checkpoint_id=", session.checkpoint_id)
         # Show summarized result if small
         try:
-            import orjson as _orjson
+            from .utils import json as _json_utils
 
-            blob = _orjson.dumps(session.result)
+            blob = _json_utils.dumps(session.result)
             txt = blob.decode("utf-8")
             print("result:")
             print(txt[:2000])
@@ -506,17 +638,17 @@ def main(argv: list[str] | None = None) -> int:
         patch_obj = None
         if args.output_file:
             try:
-                import orjson as _orjson
+                from .utils import json as _json_utils
 
-                replacement = _orjson.loads(Path(args.output_file).read_bytes())
+                replacement = _json_utils.loads(Path(args.output_file).read_bytes())
             except Exception as exc:
                 print("Failed to read replacement output:", exc)
                 return 1
         if args.state_patch_file:
             try:
-                import orjson as _orjson
+                from .utils import json as _json_utils
 
-                patch_obj = _orjson.loads(Path(args.state_patch_file).read_bytes())
+                patch_obj = _json_utils.loads(Path(args.state_patch_file).read_bytes())
             except Exception as exc:
                 print("Failed to read state patch:", exc)
                 return 1
@@ -700,6 +832,7 @@ def main(argv: list[str] | None = None) -> int:
             "Commands: list [type=.. node=.. thread=.. namespace=..] | show N | tokens N |"
             " blob N [input|output|state] | goto N | step | next [TYPE] | inject N <json> |"
             " skip N | firstdiv RUN_B | state [--pretty] | savepatch STEP FILE | lastllm |"
+            " memory | memory show N | memory diff A B [key=dot.path] | prompt N | tools [N] |"
             " help | quit"
         )
         while True:
@@ -725,7 +858,8 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     _print_timeline_filtered(filtered)
                 else:
-                    _print_timeline(rep)
+                    # Paged printing to avoid loading entire run in memory
+                    _print_timeline_paged(store, UUID(args.run_id), page_size=2000)
                 continue
             if line.startswith("show "):
                 _, s = line.split(maxsplit=1)
@@ -735,6 +869,77 @@ def main(argv: list[str] | None = None) -> int:
                     print("No such step")
                 else:
                     _print_event(evt, store)
+                continue
+            if line.strip() == "memory":
+                try:
+                    _repl_memory_list(rep)
+                except Exception as exc:
+                    print("<memory list failed:", exc, ">")
+                continue
+            if line.startswith("memory show "):
+                parts = line.split()
+                if len(parts) < 3:
+                    print("Usage: memory show STEP")
+                    continue
+                try:
+                    step = int(parts[2])
+                except Exception:
+                    print("Usage: memory show STEP")
+                    continue
+                try:
+                    _repl_memory_show(rep, store, step)
+                except Exception as exc:
+                    print("<memory show failed:", exc, ">")
+                continue
+            if line.startswith("memory diff "):
+                parts = line.split()
+                if len(parts) < 4:
+                    print("Usage: memory diff A B [key=dot.path]")
+                    continue
+                try:
+                    a_step = int(parts[2])
+                    b_step = int(parts[3])
+                except Exception:
+                    print("Usage: memory diff A B [key=dot.path]")
+                    continue
+                key = None
+                for tok in parts[4:]:
+                    if tok.startswith("key="):
+                        key = tok.split("=", 1)[1]
+                        break
+                try:
+                    _repl_memory_diff(rep, store, a_step, b_step, key)
+                except Exception as exc:
+                    print("<memory diff failed:", exc, ">")
+                continue
+            if line.startswith("prompt "):
+                parts = line.split()
+                if len(parts) != 2:
+                    print("Usage: prompt STEP")
+                    continue
+                try:
+                    step = int(parts[1])
+                except Exception:
+                    print("Usage: prompt STEP")
+                    continue
+                try:
+                    _repl_prompt(rep, store, step)
+                except Exception as exc:
+                    print("<prompt failed:", exc, ">")
+                continue
+            if line.strip() == "tools" or line.startswith("tools "):
+                parts = line.split()
+                step2: int | None = None
+                if len(parts) == 2:
+                    try:
+                        step2 = int(parts[1])
+                    except Exception:
+                        print("Usage: tools [STEP]")
+                        continue
+                try:
+                    _repl_tools(rep, store, step2)
+                except Exception as exc:
+                    print("<tools failed:", exc, ">")
                 continue
             if line.startswith("tokens "):
                 try:
@@ -840,7 +1045,8 @@ def main(argv: list[str] | None = None) -> int:
                     "Commands: list [type=.. node=.. thread=.. namespace=..] | show N | tokens N | "
                     "blob N [input|output|state] | goto N | step | next [TYPE] | inject N <json> | "
                     "skip N | firstdiv RUN_B | state [--pretty] | savepatch STEP FILE | lastllm | "
-                    "help | quit"
+                    "memory | memory show N | memory diff A B "
+                    "[key=dot.path] | prompt N | tools [N] | help | quit"
                 )
                 print(cmds)
                 continue
@@ -931,6 +1137,24 @@ def _print_timeline_filtered(events: list[Event]) -> None:
     except Exception:
         for e in events:
             print(f"{e.step:4d} {_plain_badge(e.action_type.value)} {e.actor:10s} {e.labels}")
+
+
+def _print_timeline_paged(store: LocalStore, run_id: UUID, page_size: int = 1000) -> None:
+    """Print timeline in pages to avoid loading all events in memory.
+
+    Uses plain output for robustness when multiple pages are required.
+    """
+    off = 0
+    total_printed = 0
+    while True:
+        batch = store.list_events_window(run_id, off, page_size)
+        if not batch:
+            break
+        # Prefer plain lines to avoid rendering many tables
+        for e in batch:
+            print(f"{e.step:4d} {_plain_badge(e.action_type.value)} {e.actor:10s} {e.labels}")
+            total_printed += 1
+        off += len(batch)
 
 
 def _parse_list_filters(tokens: list[str]) -> dict[str, str]:
@@ -1146,3 +1370,406 @@ def _plain_badge(kind: str) -> str:
         "ERROR": "[ERR]",
     }
     return symbols.get(kind, kind)
+
+
+# ---- Helpers for CLI tools/memory/prompt views ----
+
+
+def _read_json_blob(store: LocalStore, ref: BlobRef | None) -> object | None:
+    if ref is None:
+        return None
+    try:
+        from typing import cast as _cast
+
+        from .codec import from_bytes as _from_bytes
+
+        obj = _from_bytes(store.get_blob(ref))
+        return _cast(object, obj)
+    except Exception:
+        return None
+
+
+def _extract_tools_from_llm_event(
+    store: LocalStore, e: Event
+) -> tuple[list[object] | None, str | None]:
+    tools_digest: str | None = None
+    try:
+        if e.hashes:
+            hv = e.hashes.get("tools")
+            if isinstance(hv, str):
+                tools_digest = hv
+    except Exception:
+        pass
+    if tools_digest is None:
+        tools_digest = e.tools_digest
+    tools_list: list[object] | None = None
+    obj = _read_json_blob(store, e.input_ref)
+    if isinstance(obj, dict):
+        try:
+            t = obj.get("tools")
+            if isinstance(t, list):
+                tools_list = t
+        except Exception:
+            tools_list = None
+    return (tools_list, tools_digest)
+
+
+def _collect_tools_called(
+    events: list[Event], llm_index: int, thread_id: str | None, node: str | None
+) -> list[Event]:
+    out: list[Event] = []
+    n = len(events)
+    # scan forward until next LLM on the same thread
+    for j in range(llm_index + 1, n):
+        ev = events[j]
+        if ev.labels.get("thread_id") == thread_id and ev.action_type is ActionType.LLM:
+            break
+        if ev.action_type is ActionType.TOOL:
+            if thread_id is not None and ev.labels.get("thread_id") != thread_id:
+                continue
+            if node is not None and (ev.labels.get("node") or ev.actor) != node:
+                # prefer node label, fallback to actor
+                continue
+            out.append(ev)
+    return out
+
+
+def _build_tools_detail(store: LocalStore, events: list[Event], llm: Event) -> dict[str, object]:
+    # llm index
+    try:
+        idx = next(i for i, x in enumerate(events) if x.step == llm.step)
+    except StopIteration:
+        idx = 0
+    thread_id = llm.labels.get("thread_id")
+    node = llm.labels.get("node") or (llm.actor if llm.actor != "graph" else None)
+    tools_list, tools_digest = _extract_tools_from_llm_event(store, llm)
+    called = _collect_tools_called(events, idx, thread_id, node)
+    called_rows: list[dict[str, object]] = []
+    for t in called:
+        called_rows.append(
+            {
+                "step": t.step,
+                "tool_kind": t.tool_kind or "",
+                "tool_name": t.tool_name or "",
+                "args_hash": (t.hashes.get("args") if t.hashes else None),
+                "output_hash": (t.hashes.get("output") if t.hashes else None),
+            }
+        )
+    out: dict[str, object] = {
+        "llm_step": llm.step,
+        "actor": llm.actor,
+        "thread_id": thread_id or "",
+        "tools_digest": tools_digest or "",
+        "tools_count": (len(tools_list) if tools_list is not None else 0),
+        "called": called_rows,
+    }
+    if tools_list is not None:
+        out["tools"] = tools_list
+    # include chunks_count when present
+    try:
+        if isinstance(llm.model_meta, dict) and "chunks_count" in llm.model_meta:
+            cc_obj = llm.model_meta.get("chunks_count")
+            if isinstance(cc_obj, int | str):
+                out["chunks_count"] = int(cc_obj)
+    except Exception:
+        pass
+    return out
+
+
+def _print_tools_detail(detail: dict[str, object]) -> None:
+    # Pretty print without Rich to avoid hard dependency
+    hdr = (
+        f"LLM step: {detail.get('llm_step')}  actor={detail.get('actor')}  "
+        f"thread={detail.get('thread_id')}"
+    )
+    print(hdr)
+    td = detail.get("tools_digest") or ""
+    print(f"tools_digest={td}")
+    tc_obj = detail.get("tools_count") if "tools_count" in detail else None
+    tc = int(tc_obj) if isinstance(tc_obj, int | str) else 0
+    print(f"available_tools={tc}")
+    if "tools" in detail and isinstance(detail["tools"], list):
+        tools = detail["tools"]
+        # Show first few entries
+        head = tools[:10]
+        for i, t in enumerate(head):
+            print(f"  - tool[{i}]: {t}")
+        if len(tools) > len(head):
+            print(f"  ... ({len(tools) - len(head)} more)")
+    # Called tools
+    called = detail.get("called")
+    if isinstance(called, list):
+        print("called tools:")
+        for row in called:
+            try:
+                print(
+                    f"  - step={row.get('step')} name={row.get('tool_name') or ''} "
+                    f"kind={row.get('tool_kind') or ''} args_hash={row.get('args_hash') or ''}"
+                )
+            except Exception:
+                print(f"  - {row}")
+
+
+def _build_tools_summary(store: LocalStore, events: list[Event]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for e in events:
+        if e.action_type is not ActionType.LLM:
+            continue
+        tools_list, tools_digest = _extract_tools_from_llm_event(store, e)
+        # correlate called tools
+        try:
+            idx = next(i for i, x in enumerate(events) if x.step == e.step)
+        except StopIteration:
+            idx = 0
+        called = _collect_tools_called(
+            events,
+            idx,
+            e.labels.get("thread_id"),
+            e.labels.get("node") or (e.actor if e.actor != "graph" else None),
+        )
+        rows.append(
+            {
+                "step": e.step,
+                "actor": e.actor,
+                "thread_id": e.labels.get("thread_id") or "",
+                "tools_digest": tools_digest or "",
+                "available": len(tools_list) if tools_list is not None else 0,
+                "called": len(called),
+            }
+        )
+    return rows
+
+
+def _print_tools_summary(rows: list[dict[str, object]]) -> None:
+    try:
+        from rich.console import Console
+        from rich.table import Table
+
+        console = Console()
+        table = Table(title="Tools Summary (LLM steps)")
+        table.add_column("Step", justify="right")
+        table.add_column("Actor")
+        table.add_column("Thread")
+        table.add_column("Avail", justify="right")
+        table.add_column("Called", justify="right")
+        table.add_column("Digest")
+        for r in rows:
+            table.add_row(
+                str(r.get("step")),
+                str(r.get("actor") or ""),
+                str(r.get("thread_id") or ""),
+                str(r.get("available") or 0),
+                str(r.get("called") or 0),
+                str(r.get("tools_digest") or ""),
+            )
+        console.print(table)
+    except Exception:
+        for r in rows:
+            line1 = (
+                f"{r.get('step')!s:>4} [LLM] {r.get('actor')} "
+                f"thr={r.get('thread_id')} avail={r.get('available')}"
+            )
+            line2 = f"called={r.get('called')} digest={r.get('tools_digest')}"
+            print(line1)
+            print("  " + line2)
+
+
+def _repl_memory_list(rep: Replay) -> None:
+    events = list(rep.iter_timeline())
+    mem = [e for e in events if e.action_type in (ActionType.MEMORY, ActionType.RETRIEVAL)]
+    try:
+        from rich.console import Console
+        from rich.table import Table
+
+        console = Console()
+        table = Table(title="Memory/Retrieval Events")
+        table.add_column("Step", justify="right")
+        table.add_column("Type")
+        table.add_column("Op/Ret")
+        table.add_column("Scope")
+        table.add_column("Space")
+        table.add_column("Provider")
+        table.add_column("Thread")
+        for e in mem:
+            op = e.mem_op or (e.retriever or "")
+            table.add_row(
+                str(e.step),
+                e.action_type.value,
+                op,
+                e.mem_scope or "",
+                e.mem_space or "",
+                e.mem_provider or "",
+                e.labels.get("thread_id") or "",
+            )
+        console.print(table)
+    except Exception:
+        for e in mem:
+            op = e.mem_op or (e.retriever or "")
+            print(
+                f"{e.step:4d} [{e.action_type.value}] op={op} scope={e.mem_scope or ''} "
+                f"space={e.mem_space or ''} provider={e.mem_provider or ''} "
+                f"thr={e.labels.get('thread_id') or ''}"
+            )
+
+
+def _repl_memory_show(rep: Replay, store: LocalStore, step: int) -> None:
+    e = next((x for x in rep.iter_timeline() if x.step == step), None)
+    if not e or e.action_type not in (ActionType.MEMORY, ActionType.RETRIEVAL):
+        print("No MEMORY/RETRIEVAL event at that step")
+        return
+    obj = _read_json_blob(store, e.output_ref)
+    if obj is None:
+        print("<no blob>")
+        return
+    # Redact using privacy marks if present
+    try:
+        obj = redact(obj, e.privacy_marks or {})
+    except Exception:
+        pass
+    txt = _format_state_pretty(obj)
+    print(txt)
+
+
+def _pluck_path(obj: object, path: str | None) -> object:
+    if not path or not isinstance(obj, dict | list):
+        return obj
+    cur: object = obj
+    try:
+        for part in path.split("."):
+            if isinstance(cur, dict):
+                from typing import cast as _cast
+
+                cur = _cast(object, cur.get(part))
+            elif isinstance(cur, list):
+                idx = int(part)
+                cur = cur[idx]
+            else:
+                return cur
+    except Exception:
+        return cur
+    return cur
+
+
+def _repl_memory_diff(
+    rep: Replay, store: LocalStore, a_step: int, b_step: int, key_path: str | None
+) -> None:
+    ea = next((x for x in rep.iter_timeline() if x.step == a_step), None)
+    eb = next((x for x in rep.iter_timeline() if x.step == b_step), None)
+    if not ea or not eb:
+        print("Steps not found")
+        return
+    if ea.action_type not in (ActionType.MEMORY, ActionType.RETRIEVAL) or eb.action_type not in (
+        ActionType.MEMORY,
+        ActionType.RETRIEVAL,
+    ):
+        print("Both steps must be MEMORY/RETRIEVAL events")
+        return
+    oa = _read_json_blob(store, ea.output_ref)
+    ob = _read_json_blob(store, eb.output_ref)
+    if oa is None or ob is None:
+        print("Missing blobs for diff")
+        return
+    try:
+        oa = redact(oa, ea.privacy_marks or {})
+        ob = redact(ob, eb.privacy_marks or {})
+    except Exception:
+        pass
+    oa2 = _pluck_path(oa, key_path)
+    ob2 = _pluck_path(ob, key_path)
+    # struct diff
+    try:
+        from deepdiff import DeepDiff
+
+        dd = DeepDiff(oa2, ob2, ignore_order=False)
+        print(dict(dd))
+    except Exception:
+        # Fallback textual compare
+        sa = _format_state_pretty(oa2)
+        sb = _format_state_pretty(ob2)
+        print(sa)
+        print("--- vs ---")
+        print(sb)
+
+
+def _estimate_tokens(messages: object | None, tools: object | None) -> int:
+    # Very rough heuristic: 1 token ≈ 4 chars of text across messages and tool JSON
+    total_chars = 0
+    try:
+        if messages is not None:
+            from .codec import to_bytes as _to_bytes
+
+            total_chars += len(_to_bytes(messages))
+    except Exception:
+        pass
+    try:
+        if tools is not None:
+            from .codec import to_bytes as _to_bytes
+
+            total_chars += len(_to_bytes(tools))
+    except Exception:
+        pass
+    # Divide by 4; guard against zero
+    return max(0, total_chars // 4)
+
+
+def _repl_prompt(rep: Replay, store: LocalStore, step: int) -> None:
+    e = next((x for x in rep.iter_timeline() if x.step == step), None)
+    if not e or e.action_type is not ActionType.LLM:
+        print("No LLM event at that step")
+        return
+    print(f"LLM step {e.step}  actor={e.actor}")
+    try:
+        if e.hashes:
+            pr = e.hashes.get("prompt")
+            td = e.hashes.get("tools") or e.tools_digest
+            pc = e.hashes.get("prompt_ctx")
+            print(f"hashes: prompt={pr or ''} tools={td or ''} prompt_ctx={pc or ''}")
+    except Exception:
+        pass
+    obj = _read_json_blob(store, e.input_ref)
+    messages = None
+    tools = None
+    if isinstance(obj, dict):
+        messages = obj.get("messages")
+        tools = obj.get("tools")
+    # Show brief parts
+    try:
+        if isinstance(messages, list):
+            print(f"messages_count={len(messages)}")
+            head = messages[:5]
+            for i, m in enumerate(head):
+                if isinstance(m, dict) and isinstance(m.get("content"), str):
+                    print(f"  {i:02d}: {m['content'][:120]}")
+                else:
+                    print(f"  {i:02d}: {m}")
+            if len(messages) > len(head):
+                print(f"  ... ({len(messages) - len(head)} more)")
+    except Exception:
+        pass
+    try:
+        if isinstance(tools, list):
+            print(f"tools_count={len(tools)}")
+            t_head = tools[:10]
+            for i, t in enumerate(t_head):
+                print(f"  - tool[{i}]: {t}")
+            if len(tools) > len(t_head):
+                print(f"  ... ({len(tools) - len(t_head)} more)")
+    except Exception:
+        pass
+    # Estimate tokens
+    est_tokens = _estimate_tokens(messages, tools)
+    print(f"estimated_tokens≈{est_tokens}")
+
+
+def _repl_tools(rep: Replay, store: LocalStore, step: int | None) -> None:
+    events = list(rep.iter_timeline())
+    if step is None:
+        rows = _build_tools_summary(store, events)
+        _print_tools_summary(rows)
+        return
+    e = next((x for x in events if x.step == step and x.action_type is ActionType.LLM), None)
+    if not e:
+        print("No LLM event at that step")
+        return
+    detail = _build_tools_detail(store, events, e)
+    _print_tools_detail(detail)
