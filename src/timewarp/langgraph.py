@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .adapters.installers import bind_langgraph_record, bind_memory_taps
+from .adapters.installers import (
+    begin_recording_session,
+    bind_langgraph_record,
+    bind_memory_taps,
+)
 from .adapters.langgraph import LangGraphRecorder
 from .determinism import now as tw_now
 from .events import Run
@@ -51,6 +55,7 @@ class RecorderHandle:
         )
         teardown: Any | None = None
         teardown_mem: Any | None = None
+        end_session: Any | None = None
         recorder = LangGraphRecorder(
             graph=self.graph,
             store=self.store,
@@ -66,12 +71,19 @@ class RecorderHandle:
             event_batch_size=self.event_batch_size,
         )
         try:
+            # Scope staged hashes/memory taps to this run
+            end_session = begin_recording_session(run.run_id)
             if self.enable_record_taps:
                 teardown = bind_langgraph_record()
             if self.enable_memory_taps:
                 teardown_mem = bind_memory_taps()
             result = recorder.invoke(inputs, config=config or {})
         finally:
+            if callable(end_session):
+                try:
+                    end_session()
+                except Exception:
+                    pass
             if callable(teardown):
                 try:
                     teardown()
@@ -95,6 +107,7 @@ class RecorderHandle:
         )
         teardown: Any | None = None
         teardown_mem: Any | None = None
+        end_session: Any | None = None
         recorder = LangGraphRecorder(
             graph=self.graph,
             store=self.store,
@@ -110,6 +123,8 @@ class RecorderHandle:
             event_batch_size=self.event_batch_size,
         )
         try:
+            # Scope staged hashes/memory taps to this run
+            end_session = begin_recording_session(run.run_id)
             if self.enable_record_taps:
                 teardown = bind_langgraph_record()
             if self.enable_memory_taps:
@@ -117,6 +132,12 @@ class RecorderHandle:
             # Prefer native async recording
             result = await recorder.ainvoke(inputs, config=config or {})
         finally:
+            if callable(end_session):
+                try:
+                    # Reset session context in a thread to avoid blocking loop if needed
+                    await asyncio.to_thread(end_session)
+                except Exception:
+                    pass
             if callable(teardown):
                 try:
                     # Teardown is currently sync best-effort; run it in a thread to avoid blocking

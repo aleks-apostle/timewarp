@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
+from threading import Lock
 from typing import Any, Protocol, cast
 
 from ..determinism import now as tw_now
 from ..determinism import snapshot_rng
 from ..events import ActionType, BlobKind, Event, Run, hash_bytes
 from ..store import LocalStore
+from ..utils.hashing import hash_prompt_ctx, hash_tools_list
 from .installers import (
     try_pop_memory_taps,
     try_pop_prompt_hash,
@@ -68,6 +70,13 @@ class LangGraphRecorder:
         # Install a default tool classifier if none was provided
         if self.tool_classifier is None:
             self.tool_classifier = _default_tool_classifier()
+        # Initialize internal locks/state used for batching and clock validation
+        if not hasattr(self, "_pending_lock"):
+            self._pending_lock = Lock()
+        if not hasattr(self, "_pending_events"):
+            self._pending_events = []
+        if not hasattr(self, "_last_ts"):
+            self._last_ts = None
 
     def invoke(self, inputs: dict[str, Any], *, config: dict[str, Any] | None = None) -> Any:
         """Invoke the graph while recording events.
@@ -336,10 +345,7 @@ class LangGraphRecorder:
                 try:
                     tools = self._extract_tools_from_update(upd)
                     if tools is not None:
-                        from ..codec import to_bytes as _to_bytes
-                        from ..events import hash_bytes as _hash
-
-                        td = _hash(_to_bytes({"tools": tools}))
+                        td = hash_tools_list(tools)
                         ev_hashes["tools"] = td
                         # prompt context combines messages and tools when messages are available
                         ctx_messages = None
@@ -362,7 +368,9 @@ class LangGraphRecorder:
                             input_ref = self.store.put_blob(
                                 self.run.run_id, step, BlobKind.INPUT, parts_b
                             )
-                            ev_hashes["prompt_ctx"] = _hash(_to_bytes(ctx_obj))
+                            ev_hashes["prompt_ctx"] = hash_prompt_ctx(
+                                messages=ctx_messages, tools=tools
+                            )
                         ev_tools_digest = td
                 except Exception:
                     pass
@@ -632,7 +640,7 @@ class LangGraphRecorder:
                 extra_labels2["checkpoint_id"] = cp2
             self._persist_snapshot(step, terminal_state, labels_extra=extra_labels2)
 
-        # Flush any pending events before returning
+        # Flush any pending events before returning (synchronous to avoid cross-thread mutation)
         self._flush_events()
         # Return best-effort result without re-executing the graph
         if last_values is not None:
@@ -767,10 +775,7 @@ class LangGraphRecorder:
             input_ref = None
             try:
                 if tools_list:
-                    from ..codec import to_bytes as _to_bytes
-                    from ..events import hash_bytes as _hash
-
-                    ev_tools_digest = _hash(_to_bytes({"tools": tools_list}))
+                    ev_tools_digest = hash_tools_list(tools_list)
                     ev_hashes["tools"] = ev_tools_digest
                     if ctx_messages is not None:
                         ctx_obj = {"messages": ctx_messages, "tools": tools_list}
@@ -778,7 +783,9 @@ class LangGraphRecorder:
                         input_ref = self.store.put_blob(
                             self.run.run_id, step, BlobKind.INPUT, parts_b
                         )
-                        ev_hashes["prompt_ctx"] = _hash(_to_bytes(ctx_obj))
+                        ev_hashes["prompt_ctx"] = hash_prompt_ctx(
+                            messages=ctx_messages, tools=tools_list
+                        )
             except Exception:
                 pass
 
@@ -1203,8 +1210,8 @@ class LangGraphRecorder:
                 extra_labels2["checkpoint_id"] = cp2
             self._persist_snapshot(step, terminal_state, labels_extra=extra_labels2)
 
-        # Ensure any pending batched events are flushed; offload to thread to avoid blocking loop
-        await asyncio.to_thread(self._flush_events)
+        # Ensure any pending batched events are flushed synchronously to avoid cross-thread mutation
+        self._flush_events()
 
         if last_values is not None:
             return last_values
@@ -1353,26 +1360,95 @@ class LangGraphRecorder:
 
     # Event batching helpers
     _pending_events: list[Event] = field(default_factory=list, init=False, repr=False)
+    _pending_lock: Lock = field(default_factory=Lock, init=False, repr=False)
     # Memory synthesis state (path -> last item hash)
     _tw_mem_prev: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _last_ts: datetime | None = field(default=None, init=False, repr=False)
 
     def _append_event(self, ev: Event) -> None:
-        # Append with optional batching
+        # Monotonic timestamp validation; mark skew as a label when detected
+        try:
+            if self._last_ts is not None and ev.ts < self._last_ts:
+                new_labels = dict(ev.labels or {})
+                new_labels["ts_regressed"] = "true"
+                ev = ev.model_copy(update={"labels": new_labels})
+            # Track last seen timestamp (max)
+            if self._last_ts is None or ev.ts > self._last_ts:
+                self._last_ts = ev.ts
+        except Exception:
+            # best-effort; never fail recording due to validation
+            pass
+
         bs = max(1, int(self.event_batch_size))
         if bs == 1:
-            self.store.append_event(ev)
+            self._append_events_with_retry([ev])
             return
-        pending = self._pending_events
-        pending.append(ev)
-        if len(pending) >= bs:
-            self.store.append_events(pending)
+        # Buffered append with locking to avoid races under async/sync interleaving
+        with self._pending_lock:
+            pending = self._pending_events
+            pending.append(ev)
+            if len(pending) < bs:
+                return
+            batch = list(pending)
             pending.clear()
+        try:
+            self._append_events_with_retry(batch)
+        except Exception:
+            # Restore pending on failure (at the front) to preserve order for a later retry
+            with self._pending_lock:
+                self._pending_events[:0] = batch
+            raise
 
     def _flush_events(self) -> None:
-        pending = self._pending_events
-        if pending:
-            self.store.append_events(pending)
-            pending.clear()
+        with self._pending_lock:
+            if not self._pending_events:
+                return
+            batch = list(self._pending_events)
+            self._pending_events.clear()
+        try:
+            self._append_events_with_retry(batch)
+        except Exception:
+            # Restore and propagate error
+            with self._pending_lock:
+                self._pending_events[:0] = batch
+            raise
+
+    def _append_events_with_retry(self, events: list[Event]) -> None:
+        if not events:
+            return
+        import time as _time
+
+        backoffs = (0.05, 0.1, 0.2)
+        # First, try batched insert with a few retries
+        for i, delay in enumerate(backoffs):
+            try:
+                self.store.append_events(events)
+                return
+            except Exception:
+                if i == len(backoffs) - 1:
+                    break
+                try:
+                    _time.sleep(delay)
+                except Exception:
+                    pass
+        # Fallback: attempt per-event append to minimize loss
+        for ev in events:
+            appended = False
+            for j, delay2 in enumerate(backoffs):
+                try:
+                    self.store.append_event(ev)
+                    appended = True
+                    break
+                except Exception:
+                    if j == len(backoffs) - 1:
+                        break
+                    try:
+                        _time.sleep(delay2)
+                    except Exception:
+                        pass
+            if not appended:
+                # Bubble up after best-effort; caller may decide to retry flush later
+                raise
 
     def _flush_provider_taps(
         self,
@@ -2019,17 +2095,15 @@ class LangGraphRecorder:
         input_ref = None
         try:
             if tools_list:
-                from ..codec import to_bytes as _to_bytes
-                from ..events import hash_bytes as _hash
-
-                # Normalize as a stable envelope for hashing
-                ev_tools_digest = _hash(_to_bytes({"tools": tools_list}))
+                ev_tools_digest = hash_tools_list(tools_list)
                 ev_hashes["tools"] = ev_tools_digest
                 if ctx_messages is not None:
                     ctx_obj = {"messages": ctx_messages, "tools": tools_list}
                     parts_b = self._normalize_bytes(ctx_obj)
                     input_ref = self.store.put_blob(self.run.run_id, step, BlobKind.INPUT, parts_b)
-                    ev_hashes["prompt_ctx"] = _hash(_to_bytes(ctx_obj))
+                    ev_hashes["prompt_ctx"] = hash_prompt_ctx(
+                        messages=ctx_messages, tools=tools_list
+                    )
         except Exception:
             pass
 

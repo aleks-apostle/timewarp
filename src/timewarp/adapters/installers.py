@@ -14,27 +14,78 @@ from __future__ import annotations
 # to restore the original methods.
 from collections import deque
 from collections.abc import Callable
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
 from typing import Any
+from uuid import UUID
 
 from ..codec import to_bytes
 from ..events import hash_bytes
 from ..replay import PlaybackLLM, PlaybackMemory, PlaybackTool
 
-# --- Staging queues for record-time taps (process-local, FIFO) ---
+# --- Staging queues for record-time taps ---
+# New: session-scoped staging via ContextVar to avoid cross-run leakage.
+# We keep process-global deques as a fallback for legacy behavior.
+
+
+@dataclass
+class _RecordingSession:
+    run_id: UUID
+    prompts: deque[str] = field(default_factory=deque)
+    toolargs: deque[str] = field(default_factory=deque)
+    memtaps: deque[dict[str, Any]] = field(default_factory=deque)
+
+
+_SESSION: ContextVar[_RecordingSession | None] = ContextVar("tw_recording_session", default=None)
+
+# Legacy globals (fallback only when no active session)
 _STAGED_PROMPTS: deque[str] = deque()
 _STAGED_TOOLARGS: deque[str] = deque()
 _STAGED_MEMTAPS: deque[dict[str, Any]] = deque()
 
 
+def begin_recording_session(run_id: UUID) -> Callable[[], None]:
+    """Begin a recording session bound to the given run_id.
+
+    Returns a teardown callable that restores the previous session.
+    """
+
+    sess = _RecordingSession(run_id=run_id)
+    token: Token[_RecordingSession | None] = _SESSION.set(sess)
+
+    def _end() -> None:
+        try:
+            _SESSION.reset(token)
+        except Exception:
+            # best-effort
+            pass
+
+    return _end
+
+
 def stage_prompt_hash(h: str) -> None:
+    sess = _SESSION.get()
+    if sess is not None:
+        sess.prompts.append(h)
+        return
     _STAGED_PROMPTS.append(h)
 
 
 def stage_tool_args_hash(h: str) -> None:
+    sess = _SESSION.get()
+    if sess is not None:
+        sess.toolargs.append(h)
+        return
     _STAGED_TOOLARGS.append(h)
 
 
 def try_pop_prompt_hash() -> str | None:
+    sess = _SESSION.get()
+    if sess is not None:
+        try:
+            return sess.prompts.popleft()
+        except Exception:
+            return None
     try:
         return _STAGED_PROMPTS.popleft()
     except Exception:
@@ -42,6 +93,12 @@ def try_pop_prompt_hash() -> str | None:
 
 
 def try_pop_tool_args_hash() -> str | None:
+    sess = _SESSION.get()
+    if sess is not None:
+        try:
+            return sess.toolargs.popleft()
+        except Exception:
+            return None
     try:
         return _STAGED_TOOLARGS.popleft()
     except Exception:
@@ -366,8 +423,12 @@ def stage_memory_tap(env: dict[str, Any]) -> None:
         kind = env.get("kind")
         if kind not in ("MEMORY", "RETRIEVAL"):
             return
-        # Store a shallow copy to avoid caller mutation after staging
-        _STAGED_MEMTAPS.append(dict(env))
+        payload = dict(env)  # shallow copy
+        sess = _SESSION.get()
+        if sess is not None:
+            sess.memtaps.append(payload)
+        else:
+            _STAGED_MEMTAPS.append(payload)
     except Exception:
         # best-effort
         return
@@ -380,11 +441,21 @@ def try_pop_memory_taps(max_items: int = 1000) -> list[dict[str, Any]]:
     alongside core events, preserving causality in step ordering.
     """
     out: list[dict[str, Any]] = []
+    sess = _SESSION.get()
+    if sess is not None:
+        try:
+            n = 0
+            while sess.memtaps and n < max_items:
+                out.append(sess.memtaps.popleft())
+                n += 1
+        except Exception:
+            pass
+        return out
     try:
-        n = 0
-        while _STAGED_MEMTAPS and n < max_items:
+        n2 = 0
+        while _STAGED_MEMTAPS and n2 < max_items:
             out.append(_STAGED_MEMTAPS.popleft())
-            n += 1
+            n2 += 1
     except Exception:
         # Leave remaining items for next pass
         pass

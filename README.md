@@ -169,6 +169,33 @@ Notes
  - Save patch: `savepatch STEP file.json` writes the event’s output JSON for reuse with `inject`.
   - Event batching: `event_batch_size` batches DB writes for throughput. For heavy runs, try `50` or `100`.
 
+Tools, Prompt, and Memory Views
+-------------------------------
+
+Inspect tools available to the model and tools actually called, plus prompt parts and memory events:
+
+```
+# Tools summary across LLM steps
+timewarp ./timewarp.sqlite3 ./blobs tools <run_id>
+
+# Tools detail for a specific LLM step
+timewarp ./timewarp.sqlite3 ./blobs tools <run_id> --step 42 --json
+
+# Inside the debug REPL
+> tools            # summary across LLM steps
+> tools 42         # detail for step 42
+> prompt 42        # prompt parts (messages + tools), hashes, token estimate
+> memory           # list MEMORY/RETRIEVAL events
+> memory show 120  # pretty-print a specific memory/retrieval payload
+> memory diff 120 140 key=items.0  # structural diff; optional dot path
+```
+
+Details
+- Available tools: extracted from recorded prompt parts when present; `tools_digest` shows a stable hash when details aren’t recorded.
+- Called tools: correlated by `thread_id` and node, scanning forward until the next LLM event on the same thread.
+- Token estimate: provider-agnostic heuristic (≈ chars/4) to quickly gauge prompt size; for precise tokens/costs integrate a tokenizer.
+- Privacy: printed payloads respect `privacy_marks` redaction.
+
 Record‑time taps (determinism)
 ------------------------------
 

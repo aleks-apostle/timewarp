@@ -10,6 +10,7 @@ from .determinism import freeze_time_at
 from .events import ActionType, BlobKind, Event, hash_bytes
 from .store import LocalStore
 from .telemetry import replay_span_for_event
+from .utils.hashing import hash_prompt, hash_prompt_ctx, hash_tools_list
 
 
 class ReplayError(Exception):
@@ -139,30 +140,6 @@ class _EventCursor:
         )
 
 
-def _hash_prompt_like(prompt: Any, *, messages: Any | None = None) -> str:
-    """Compute a stable sha256 hex over LLM prompt/messages like the recorder.
-
-    Best-effort: if messages provided, prefer it; else hash the prompt itself.
-    """
-    try:
-        obj: Any
-        if messages is not None:
-            obj = {"messages": messages}
-        else:
-            obj = {"prompt": prompt}
-        return hash_bytes(to_bytes(obj))
-    except Exception:
-        # last resort
-        return hash_bytes(to_bytes({"_repr": repr(prompt)}))
-
-
-def _hash_tools_list(tools: Any) -> str:
-    try:
-        return hash_bytes(to_bytes({"tools": tools}))
-    except Exception:
-        return hash_bytes(to_bytes({"_repr": repr(tools)}))
-
-
 @dataclass
 class PlaybackLLM:
     store: LocalStore
@@ -182,7 +159,7 @@ class PlaybackLLM:
         if recorded_prompt_hash:
             # Attempt to extract messages-style input
             msgs = kwargs.get("messages")
-            got_hash = _hash_prompt_like(prompt, messages=msgs)
+            got_hash = hash_prompt(messages=msgs, prompt=prompt)
             if got_hash != recorded_prompt_hash:
                 raise LLMPromptMismatch(
                     ev.step, expected_hash=recorded_prompt_hash, got_hash=got_hash
@@ -204,7 +181,7 @@ class PlaybackLLM:
                 )
             )
             if observed_tools is not None and recorded_tools_digest is not None:
-                got_td = _hash_tools_list(observed_tools)
+                got_td = hash_tools_list(observed_tools)
                 if got_td != recorded_tools_digest:
                     raise ToolsDigestMismatch(
                         ev.step, expected_digest=recorded_tools_digest, got_digest=got_td
@@ -228,7 +205,7 @@ class PlaybackLLM:
                     )
                 )
                 if msgs2 is not None and tools2 is not None:
-                    got_ctx = hash_bytes(to_bytes({"messages": msgs2, "tools": tools2}))
+                    got_ctx = hash_prompt_ctx(messages=msgs2, tools=tools2)
                     if got_ctx != recorded_ctx:
                         raise PromptContextMismatch(
                             ev.step, expected_hash=recorded_ctx, got_hash=got_ctx
