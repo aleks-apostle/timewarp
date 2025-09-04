@@ -67,6 +67,49 @@ class ToolArgsMismatch(ReplayError):
         )
 
 
+class ToolsDigestMismatch(ReplayError):
+    def __init__(self, step: int, *, expected_digest: str | None, got_digest: str | None) -> None:
+        self.step = step
+        self.expected_digest = expected_digest
+        self.got_digest = got_digest
+        super().__init__(
+            f"LLM tools digest mismatch at step={step}: expected={expected_digest} got={got_digest}"
+        )
+
+
+class PromptContextMismatch(ReplayError):
+    def __init__(self, step: int, *, expected_hash: str | None, got_hash: str | None) -> None:
+        self.step = step
+        self.expected_hash = expected_hash
+        self.got_hash = got_hash
+        super().__init__(
+            f"LLM prompt_ctx mismatch at step={step}: expected={expected_hash} got={got_hash}"
+        )
+
+
+class RetrievalQueryMismatch(ReplayError):
+    def __init__(self, step: int, *, expected_hash: str | None, got_hash: str | None) -> None:
+        self.step = step
+        self.expected_hash = expected_hash
+        self.got_hash = got_hash
+        super().__init__(
+            f"RETRIEVAL query mismatch at step={step}: expected={expected_hash} got={got_hash}"
+        )
+
+
+class RetrievalPolicyMismatch(ReplayError):
+    def __init__(
+        self, step: int, *, field: str, expected: str | int | None, got: str | int | None
+    ) -> None:
+        self.step = step
+        self.field = field
+        self.expected = expected
+        self.got = got
+        super().__init__(
+            f"RETRIEVAL policy mismatch at step={step} ({field}): expected={expected} got={got}"
+        )
+
+
 class ModelMetaMismatch(ReplayError):
     def __init__(self, step: int, *, diffs: list[str]) -> None:
         self.step = step
@@ -113,6 +156,13 @@ def _hash_prompt_like(prompt: Any, *, messages: Any | None = None) -> str:
         return hash_bytes(to_bytes({"_repr": repr(prompt)}))
 
 
+def _hash_tools_list(tools: Any) -> str:
+    try:
+        return hash_bytes(to_bytes({"tools": tools}))
+    except Exception:
+        return hash_bytes(to_bytes({"_repr": repr(tools)}))
+
+
 @dataclass
 class PlaybackLLM:
     store: LocalStore
@@ -137,6 +187,56 @@ class PlaybackLLM:
                 raise LLMPromptMismatch(
                     ev.step, expected_hash=recorded_prompt_hash, got_hash=got_hash
                 )
+        # Optional tools digest validation (best-effort)
+        try:
+            recorded_tools_digest: str | None = None
+            if ev.hashes:
+                recorded_tools_digest = ev.hashes.get("tools")
+            if recorded_tools_digest is None:
+                recorded_tools_digest = ev.tools_digest
+            observed_tools = (
+                kwargs.get("tools")
+                or kwargs.get("available_tools")
+                or (
+                    kwargs.get("_tw_model_meta", {}).get("tools")
+                    if isinstance(kwargs.get("_tw_model_meta"), dict)
+                    else None
+                )
+            )
+            if observed_tools is not None and recorded_tools_digest is not None:
+                got_td = _hash_tools_list(observed_tools)
+                if got_td != recorded_tools_digest:
+                    raise ToolsDigestMismatch(
+                        ev.step, expected_digest=recorded_tools_digest, got_digest=got_td
+                    )
+        except ToolsDigestMismatch:
+            raise
+        except Exception:
+            pass
+        # Optional prompt_ctx validation when both messages and tools are available
+        try:
+            recorded_ctx: str | None = ev.hashes.get("prompt_ctx") if ev.hashes else None
+            if recorded_ctx is not None:
+                msgs2 = kwargs.get("messages")
+                tools2 = (
+                    kwargs.get("tools")
+                    or kwargs.get("available_tools")
+                    or (
+                        kwargs.get("_tw_model_meta", {}).get("tools")
+                        if isinstance(kwargs.get("_tw_model_meta"), dict)
+                        else None
+                    )
+                )
+                if msgs2 is not None and tools2 is not None:
+                    got_ctx = hash_bytes(to_bytes({"messages": msgs2, "tools": tools2}))
+                    if got_ctx != recorded_ctx:
+                        raise PromptContextMismatch(
+                            ev.step, expected_hash=recorded_ctx, got_hash=got_ctx
+                        )
+        except PromptContextMismatch:
+            raise
+        except Exception:
+            pass
         # Optional model_meta validation (subset, opt-in)
         if self.strict_meta:
             try:
@@ -162,6 +262,74 @@ class PlaybackLLM:
                 )
             raw = self.store.get_blob(ev.output_ref)
             return from_bytes(raw)
+
+        if self.freeze_time:
+            with freeze_time_at(ev.ts):
+                return _produce()
+        return _produce()
+
+
+@dataclass
+class PlaybackMemory:
+    store: LocalStore
+    retrieval_cursor: _EventCursor
+    freeze_time: bool = False
+
+    def retrieve(
+        self,
+        query: Any | None = None,
+        *,
+        retriever: str | None = None,
+        top_k: int | None = None,
+    ) -> list[Any] | Any:
+        """Return recorded retrieval items for the next RETRIEVAL event.
+
+        Validates query hash, retriever, and top_k when present on the recorded event.
+        Returns the recorded payload's items list by default.
+        """
+        ev = self.retrieval_cursor.next()
+        # Validate query hash when present
+        try:
+            expected_q = ev.hashes.get("query") if ev.hashes else None
+            if expected_q is not None and query is not None:
+                got_q = hash_bytes(to_bytes(query))
+                if got_q != expected_q:
+                    raise RetrievalQueryMismatch(ev.step, expected_hash=expected_q, got_hash=got_q)
+        except RetrievalQueryMismatch:
+            raise
+        except Exception:
+            pass
+        # Validate simple policy fields if available
+        try:
+            if ev.top_k is not None and top_k is not None and int(ev.top_k) != int(top_k):
+                raise RetrievalPolicyMismatch(ev.step, field="top_k", expected=ev.top_k, got=top_k)
+            if (
+                ev.retriever is not None
+                and retriever is not None
+                and str(ev.retriever) != str(retriever)
+            ):
+                raise RetrievalPolicyMismatch(
+                    ev.step, field="retriever", expected=ev.retriever, got=retriever
+                )
+        except RetrievalPolicyMismatch:
+            raise
+        except Exception:
+            pass
+
+        # Produce items from recorded blob
+        def _produce() -> list[Any] | Any:
+            if not ev.output_ref:
+                raise MissingBlob(
+                    run_id=ev.run_id, step=ev.step, kind=BlobKind.MEMORY, path="<none>"
+                )
+            raw = self.store.get_blob(ev.output_ref)
+            obj = from_bytes(raw)
+            try:
+                if isinstance(obj, dict) and isinstance(obj.get("items"), list):
+                    return obj["items"]
+            except Exception:
+                pass
+            return obj
 
         if self.freeze_time:
             with freeze_time_at(ev.ts):
@@ -247,7 +415,7 @@ class LangGraphReplayer:
         from_step: int | None,
         thread_id: str | None,
         *,
-        install_wrappers: Callable[[PlaybackLLM, PlaybackTool], None] | None = None,
+        install_wrappers: Callable[[PlaybackLLM, PlaybackTool, PlaybackMemory], None] | None = None,
         freeze_time: bool = False,
     ) -> ReplaySession:
         events = self.store.list_events(run_id)
@@ -275,8 +443,13 @@ class LangGraphReplayer:
         )
         llm = PlaybackLLM(store=self.store, cursor=llm_cursor)
         tool = PlaybackTool(store=self.store, cursor=tool_cursor)
+        mem_cursor = _EventCursor(
+            events=events, action_type=ActionType.RETRIEVAL, start_index=0, thread_id=thread_id
+        )
+        memory = PlaybackMemory(store=self.store, retrieval_cursor=mem_cursor)
         llm.freeze_time = freeze_time
         tool.freeze_time = freeze_time
+        memory.freeze_time = freeze_time
         # If caller provides installer, let them bind wrappers to the graph runtime
         if install_wrappers is None:
             # If there are any LLM/TOOL events, require wrappers to avoid live side-effects
@@ -291,7 +464,7 @@ class LangGraphReplayer:
                     "`resume` command which binds automatically."
                 )
         else:
-            install_wrappers(llm, tool)
+            install_wrappers(llm, tool, memory)
         # Execute graph from checkpoint using values-stream to advance deterministically
         result: Any | None = None
         cfg: dict[str, Any] = {"configurable": {}}
@@ -338,7 +511,7 @@ class LangGraphReplayer:
         replacement: Any,
         thread_id: str | None,
         *,
-        install_wrappers: Callable[[PlaybackLLM, PlaybackTool], None] | None = None,
+        install_wrappers: Callable[..., None] | None = None,
         freeze_time: bool = False,
     ) -> UUID:
         """Prepare a forked run by installing an override for a single LLM/TOOL event.
@@ -366,9 +539,32 @@ class LangGraphReplayer:
             override={at_step: replacement},
             freeze_time=freeze_time,
         )
+        # Build playback memory wrapper for recorded retrieval events (for provider patching)
+        mem_cursor = _EventCursor(
+            events=events, action_type=ActionType.RETRIEVAL, start_index=0, thread_id=thread_id
+        )
+        memory = PlaybackMemory(store=self.store, retrieval_cursor=mem_cursor)
+        memory.freeze_time = freeze_time
         if install_wrappers is None:
             raise AdapterInvariant("install_wrappers is required to bind overrides for forking")
-        install_wrappers(llm, tool)
+        # Backward-compatible: support installers that accept (llm, tool) or (llm, tool, memory)
+        try:
+            import inspect as _inspect
+
+            n_params = len(_inspect.signature(install_wrappers).parameters)
+        except Exception:
+            n_params = 2
+        try:
+            if n_params >= 3:
+                install_wrappers(llm, tool, memory)
+            else:
+                install_wrappers(llm, tool)
+        except TypeError:
+            # Fallback if arity detection failed
+            try:
+                install_wrappers(llm, tool)
+            except Exception:
+                raise
         # Create a forked Run with branch metadata for discoverability.
         # Attempt to copy basic metadata from the original Run.
         try:
@@ -688,10 +884,10 @@ class Replay:
 
         from .adapters import installers as _installers
 
-        def _installer(llm: PlaybackLLM, tool: PlaybackTool) -> None:
+        def _installer(llm: PlaybackLLM, tool: PlaybackTool, memory: PlaybackMemory) -> None:
             llm.strict_meta = bool(strict_meta)
             tool.strict_meta = bool(strict_meta)
-            _installers.bind_langgraph_playback(graph, llm, tool)
+            _installers.bind_langgraph_playback(graph, llm, tool, memory)
 
         replayer = LangGraphReplayer(graph=graph, store=store)
         return replayer.resume(

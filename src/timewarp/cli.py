@@ -453,9 +453,9 @@ def main(argv: list[str] | None = None) -> int:
             print("Failed to import app factory:", exc)
             return 1
 
-        from timewarp.replay import PlaybackLLM, PlaybackTool  # local import for typing
+        from timewarp.replay import PlaybackLLM, PlaybackMemory, PlaybackTool  # typing
 
-        def installer(llm: PlaybackLLM, tool: PlaybackTool) -> None:
+        def installer_resume(llm: PlaybackLLM, tool: PlaybackTool, memory: PlaybackMemory) -> None:
             try:
                 # Toggle strict model_meta validation when requested
                 try:
@@ -463,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
                     tool.strict_meta = bool(args.strict_meta)
                 except Exception:
                     pass
-                _installers.bind_langgraph_playback(graph, llm, tool)
+                _installers.bind_langgraph_playback(graph, llm, tool, memory)
             except Exception as exc:  # pragma: no cover
                 print("Warning: failed to bind playback wrappers:", exc)
 
@@ -472,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
             UUID(args.run_id),
             args.from_step,
             args.thread_id,
-            install_wrappers=installer,
+            install_wrappers=installer_resume,
             freeze_time=bool(getattr(args, "freeze_time", False)),
         )
         print("Resumed run:", args.run_id)
@@ -534,18 +534,22 @@ def main(argv: list[str] | None = None) -> int:
 
         from collections.abc import Callable
 
-        from timewarp.replay import PlaybackLLM, PlaybackTool  # local import for typing
+        from timewarp.replay import (  # local import for typing
+            PlaybackLLM,
+            PlaybackMemory,
+            PlaybackTool,
+        )
 
         teardowns: list[Callable[[], None]] = []
 
-        def installer(llm: PlaybackLLM, tool: PlaybackTool) -> None:
+        def installer_inject(llm: PlaybackLLM, tool: PlaybackTool, memory: PlaybackMemory) -> None:
             try:
                 try:
                     llm.strict_meta = bool(args.strict_meta)
                     tool.strict_meta = bool(args.strict_meta)
                 except Exception:
                     pass
-                td = _installers.bind_langgraph_playback(graph, llm, tool)
+                td = _installers.bind_langgraph_playback(graph, llm, tool, memory)
                 # retain teardown in outer scope
                 teardowns.append(td)
             except Exception as exc:  # pragma: no cover
@@ -602,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
             args.step,
             replacement,
             args.thread_id,
-            install_wrappers=installer,
+            install_wrappers=installer_inject,
             freeze_time=bool(getattr(args, "freeze_time", False)),
         )
         # If recording now, execute the graph with a recorder bound to the new run id

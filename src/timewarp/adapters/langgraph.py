@@ -9,7 +9,11 @@ from ..determinism import now as tw_now
 from ..determinism import snapshot_rng
 from ..events import ActionType, BlobKind, Event, Run, hash_bytes
 from ..store import LocalStore
-from .installers import try_pop_prompt_hash, try_pop_tool_args_hash
+from .installers import (
+    try_pop_memory_taps,
+    try_pop_prompt_hash,
+    try_pop_tool_args_hash,
+)
 
 
 class ToolClassifier(Protocol):
@@ -279,39 +283,6 @@ class LangGraphRecorder:
                             pass
                 except Exception:
                     pass
-                # Tools digest and prompt context (async non-messages)
-                try:
-                    tools = self._extract_tools_from_update(upd)
-                    if tools is not None:
-                        from ..codec import to_bytes as _to_bytes
-                        from ..events import hash_bytes as _hash
-
-                        td = _hash(_to_bytes({"tools": tools}))
-                        ev_hashes["tools"] = td
-                        ctx_messages = None
-                        try:
-                            obs2 = upd if isinstance(upd, dict) else {}
-                            for pkey in (
-                                "llm_input_messages",
-                                "input_messages",
-                                "messages",
-                                "prompt",
-                            ):
-                                if isinstance(obs2, dict) and pkey in obs2:
-                                    ctx_messages = obs2[pkey]
-                                    break
-                        except Exception:
-                            ctx_messages = None
-                        if ctx_messages is not None:
-                            ctx_obj = {"messages": ctx_messages, "tools": tools}
-                            parts_b = self._normalize_bytes(ctx_obj)
-                            input_ref = self.store.put_blob(
-                                self.run.run_id, step, BlobKind.INPUT, parts_b
-                            )
-                            ev_hashes["prompt_ctx"] = _hash(_to_bytes(ctx_obj))
-                        ev_tools_digest = td
-                except Exception:
-                    pass
                 # Merge staged prompt hash when stream metadata is insufficient
                 try:
                     if "prompt" not in ev_hashes:
@@ -446,6 +417,16 @@ class LangGraphRecorder:
 
             self._append_event(ev)
             step += 1  # advance step after recording the update event
+            # Persist any provider-tap MEMORY/RETRIEVAL events staged by patched providers
+            try:
+                step = self._flush_provider_taps(
+                    step=step,
+                    actor=actor,
+                    namespace_label=namespace_label,
+                    thread_id=thread_id,
+                )
+            except Exception:  # pragma: no cover
+                pass
             updates_seen += 1
             # Emit MEMORY events synthesized from values stream (when configured)
             try:
@@ -608,6 +589,16 @@ class LangGraphRecorder:
 
         # Flush any trailing aggregated messages once stream ends
         flush_messages()
+        # Final provider-tap flush to capture any late taps
+        try:
+            step = self._flush_provider_taps(
+                step=step,
+                actor="graph",
+                namespace_label=None,
+                thread_id=thread_id,
+            )
+        except Exception:  # pragma: no cover
+            pass
 
         # Persist a terminal snapshot/state if possible
         terminal_state: Any | None = None
@@ -1017,6 +1008,15 @@ class LangGraphRecorder:
 
             self._append_event(ev)
             step += 1
+            try:
+                step = self._flush_provider_taps(
+                    step=step,
+                    actor=actor,
+                    namespace_label=namespace_label,
+                    thread_id=thread_id,
+                )
+            except Exception:
+                pass
             updates_seen += 1
 
             # MEMORY synthesis from values stream when configured (async)
@@ -1374,6 +1374,137 @@ class LangGraphRecorder:
             self.store.append_events(pending)
             pending.clear()
 
+    def _flush_provider_taps(
+        self,
+        *,
+        step: int,
+        actor: str,
+        namespace_label: str | None,
+        thread_id: str | None,
+    ) -> int:
+        """Persist any staged provider-tap envelopes as MEMORY/RETRIEVAL events.
+
+        Returns the next step value after appending zero or more events.
+        """
+        taps = try_pop_memory_taps()
+        if not taps:
+            return step
+
+        for env in taps:
+            kind = env.get("kind")
+            try:
+                if kind == "MEMORY":
+                    # Normalize
+                    key = env.get("key")
+                    value = env.get("value")
+                    mem_op = env.get("mem_op") or "PUT"
+                    mem_provider = env.get("mem_provider") or "Custom"
+                    mem_scope = env.get("mem_scope") or (
+                        self._infer_mem_scope_from_path(str(key)) if isinstance(key, str) else None
+                    )
+                    mem_space = env.get("mem_space") or (actor or "graph")
+                    payload = {"key": key, "value": self._prune_mem_value(value)}
+                    data_b = self._normalize_bytes(payload)
+                    blob = self.store.put_blob(self.run.run_id, step, BlobKind.MEMORY, data_b)
+                    h = blob.sha256_hex
+                    labels: dict[str, str] = {}
+                    if namespace_label:
+                        labels["namespace"] = namespace_label
+                    if thread_id:
+                        labels["thread_id"] = thread_id
+                    if actor and actor != "graph":
+                        labels["node"] = actor
+                    labels["mem_op"] = str(mem_op)
+                    if mem_scope:
+                        labels["mem_scope"] = str(mem_scope)
+                    labels["mem_space"] = str(mem_space)
+                    try:
+                        labels["anchor_id"] = self._make_anchor_id(ActionType.MEMORY, actor, labels)
+                    except Exception:
+                        pass
+                    ev = Event(
+                        run_id=self.run.run_id,
+                        step=step,
+                        action_type=ActionType.MEMORY,
+                        actor=actor or "graph",
+                        output_ref=blob,
+                        hashes={"item": h},
+                        labels=labels,
+                        model_meta={
+                            "adapter_version": self.ADAPTER_VERSION,
+                            "framework": "langgraph",
+                            "mem_provider": str(mem_provider),
+                        },
+                        ts=tw_now(),
+                    )
+                    ev = ev.model_copy(update={"mem_provider": str(mem_provider)})
+                    self._append_event(ev)
+                    step += 1
+                elif kind == "RETRIEVAL":
+                    query = env.get("query")
+                    items = env.get("items")
+                    policy = env.get("policy") or {}
+                    if not isinstance(items, list) or not items:
+                        continue
+                    retriever = policy.get("retriever") if isinstance(policy, dict) else None
+                    top_k = policy.get("top_k") if isinstance(policy, dict) else None
+                    mem_provider = env.get("mem_provider") or "Custom"
+                    query_id = env.get("query_id")
+                    payload = {"query": query, "items": items, "policy": policy}
+                    data_b = self._normalize_bytes(payload)
+                    blob = self.store.put_blob(self.run.run_id, step, BlobKind.MEMORY, data_b)
+                    hashes: dict[str, str] = {}
+                    try:
+                        from ..codec import to_bytes as _to_bytes
+
+                        if query is not None:
+                            hashes["query"] = hash_bytes(_to_bytes(query))
+                        hashes["results"] = hash_bytes(_to_bytes({"items": items}))
+                    except Exception:
+                        pass
+                    labels2: dict[str, str] = {}
+                    if namespace_label:
+                        labels2["namespace"] = namespace_label
+                    if thread_id:
+                        labels2["thread_id"] = thread_id
+                    if actor and actor != "graph":
+                        labels2["node"] = actor
+                    try:
+                        labels2["anchor_id"] = self._make_anchor_id(
+                            ActionType.RETRIEVAL, actor, labels2
+                        )
+                    except Exception:
+                        pass
+                    ev2 = Event(
+                        run_id=self.run.run_id,
+                        step=step,
+                        action_type=ActionType.RETRIEVAL,
+                        actor=actor or "graph",
+                        output_ref=blob,
+                        hashes=hashes,
+                        labels=labels2,
+                        model_meta={
+                            "adapter_version": self.ADAPTER_VERSION,
+                            "framework": "langgraph",
+                            "mem_provider": str(mem_provider),
+                        },
+                        ts=tw_now(),
+                    )
+                    # Convenience top-level fields
+                    ev2 = ev2.model_copy(
+                        update={
+                            "retriever": str(retriever) if isinstance(retriever, str) else None,
+                            "top_k": int(top_k) if isinstance(top_k, int) else None,
+                            "query_id": str(query_id) if isinstance(query_id, str | int) else None,
+                            "mem_provider": str(mem_provider),
+                        }
+                    )
+                    self._append_event(ev2)
+                    step += 1
+            except Exception:  # pragma: no cover
+                continue
+        return step
+
     def _normalize_bytes(self, obj: Any) -> bytes:
         from ..codec import to_bytes
         from ..events import redact
@@ -1554,14 +1685,14 @@ class LangGraphRecorder:
                             if isinstance(s, int | float)
                             else (d if isinstance(d, int | float) else None)
                         )
-                    out = {
+                    out_item: dict[str, Any] = {
                         "id": str(iid) if iid is not None else str(idx),
                         "text": str(txt) if txt is not None else "",
                         "metadata": meta if isinstance(meta, dict) else {},
                     }
                     if isinstance(score, int | float):
-                        out["score"] = float(score)
-                    return out
+                        out_item["score"] = float(score)
+                    return out_item
                 except Exception:
                     return {"id": str(idx), "text": ""}
 
