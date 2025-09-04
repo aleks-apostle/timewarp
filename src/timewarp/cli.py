@@ -37,6 +37,25 @@ def main(argv: list[str] | None = None) -> int:
     evp.add_argument("--limit", type=int, default=1000000, help="Pagination limit")
     evp.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON output")
 
+    # fsck: verify referenced blobs for a run; optionally repair and GC orphans
+    fsp = sub.add_parser(
+        "fsck",
+        help="Verify blobs referenced by a run and optionally repair/gc orphans",
+    )
+    fsp.add_argument("run_id", help="Run ID to check")
+    fsp.add_argument(
+        "--repair",
+        dest="repair",
+        action="store_true",
+        help="Repair missing final blobs using .tmp files when available",
+    )
+    fsp.add_argument(
+        "--gc-orphans",
+        dest="gc_orphans",
+        action="store_true",
+        help="Garbage-collect orphaned blobs not referenced by the run",
+    )
+
     # tools: show available tools per LLM and called tools around it
     tlsp = sub.add_parser(
         "tools",
