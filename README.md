@@ -1,6 +1,12 @@
 Timewarp — Deterministic Replay & Time‑Travel Debugger for LLM Agent Workflows
 ==============================================================================
 
+[![PyPI](https://img.shields.io/pypi/v/timewarp-llm.svg)](https://pypi.org/project/timewarp-llm/)
+[![Python Versions](https://img.shields.io/pypi/pyversions/timewarp-llm.svg)](https://pypi.org/project/timewarp-llm/)
+[![License](https://img.shields.io/pypi/l/timewarp-llm.svg)](./LICENSE)
+[![CI](https://github.com/aleks-apostle/timewarp/actions/workflows/ci.yml/badge.svg)](https://github.com/aleks-apostle/timewarp/actions/workflows/ci.yml)
+[![Publish](https://github.com/aleks-apostle/timewarp/actions/workflows/release.yml/badge.svg)](https://github.com/aleks-apostle/timewarp/actions/workflows/release.yml)
+
 Record every step. Rewind any step. Reproduce any run.
 
 Timewarp adds event‑sourced logging and deterministic replay to agent frameworks (LangGraph first, LangChain optional), plus a CLI debugger for step‑through, diffs, and what‑if edits. It fills a well‑documented gap: mainstream tools visualize traces but don’t let you replay them exactly.
