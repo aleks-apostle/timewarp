@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from timewarp.adapters.installers import bind_langgraph_record
+from timewarp.adapters.installers import begin_recording_session, bind_langgraph_record
 from timewarp.adapters.langgraph import LangGraphRecorder
 from timewarp.events import ActionType, Run
 from timewarp.store import LocalStore
@@ -44,6 +44,8 @@ def test_record_taps_add_prompt_hash(tmp_path: Path) -> None:
 
     teardown = bind_langgraph_record()
     try:
+        # Ensure a recording session is active so staged hashes are scoped
+        end_session = begin_recording_session(run.run_id)
         rec = LangGraphRecorder(
             graph=compiled,
             store=store,
@@ -54,6 +56,10 @@ def test_record_taps_add_prompt_hash(tmp_path: Path) -> None:
         )
         _ = rec.invoke({"text": "hi"}, config={"configurable": {"thread_id": "t1"}})
     finally:
+        try:
+            end_session()
+        except Exception:
+            pass
         teardown()
 
     events = store.list_events(run.run_id)

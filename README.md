@@ -28,7 +28,7 @@ What’s Included (v0.1 core)
   - `LangGraphReplayer.resume()` re‑executes from nearest checkpoint using recorded outputs
   - What‑if overrides supported (one‑shot per step)
 - CLI
-  - `timewarp list|debug|diff`, plus `resume` and `inject` commands (see below)
+  - `timewarp list|events|tools|diff|debug`, plus `resume`, `inject`, and `fsck` (see below)
   - `export langsmith <run_id>` to serialize runs/events for external tooling
 - Telemetry (optional)
   - OpenTelemetry spans per event; replay spans link to originals via Span Links
@@ -39,7 +39,16 @@ What’s Included (v0.1 core)
 Install & Dev
 -------------
 
-Requires Python 3.12+.
+Requires Python 3.11+.
+
+Install from PyPI:
+
+```
+pip install timewarp-llm
+# optional extras
+pip install 'timewarp-llm[adapters]'
+pip install 'timewarp-llm[otel]'
+```
 
 ```
 uv venv && uv pip install -e .[dev]
@@ -109,6 +118,28 @@ timewarp ./timewarp.db ./blobs list
 timewarp ./timewarp.db ./blobs debug <run_id>
 timewarp ./timewarp.db ./blobs diff <run_a> <run_b>
 timewarp ./timewarp.db ./blobs events <run_id> --type LLM --node compose --thread t-1 --json
+```
+
+Integrity Check (fsck)
+----------------------
+
+Verify that all blobs referenced by a run exist on disk; optionally repair and garbage‑collect orphans. Emits JSON for easy automation.
+
+```
+# Basic verification (JSON output)
+timewarp ./timewarp.db ./blobs fsck <run_id>
+# Attempt repair by promoting any matching .tmp files to final .bin
+timewarp ./timewarp.db ./blobs fsck <run_id> --repair
+# Remove blob files on disk that are not referenced by the run (dangerous)
+timewarp ./timewarp.db ./blobs fsck <run_id> --gc-orphans
+```
+
+Output shape:
+
+```
+{"missing": ["runs/<id>/events/12/output.bin", ...],
+ "repaired": ["runs/<id>/events/12/output.bin", ...],
+ "orphans_gc": ["runs/<id>/events/99/output.bin.tmp", ...]}
 ```
 
 Delta Debugging (Minimal Failing Delta)
@@ -199,20 +230,28 @@ Details
 Record‑time taps (determinism)
 ------------------------------
 
-For stronger determinism checks, Timewarp can compute and store `hashes.prompt` and `hashes.args` at call sites (LangChain core):
+For stronger determinism checks, Timewarp can compute and store `hashes.prompt` and `hashes.args` at call sites (LangChain core). When using installers directly, start a recording session to scope staged hashes to the current run:
 
 ```
-from timewarp.adapters.installers import bind_langgraph_record
+from timewarp.adapters.installers import (
+    begin_recording_session,
+    bind_langgraph_record,
+)
 
+# Assuming you are using LangGraphRecorder with a concrete Run object
+end_session = begin_recording_session(run.run_id)
 teardown = bind_langgraph_record()
 try:
     # run your graph under the recorder
     ...
 finally:
+    # Ensure both session and patches are cleaned up
+    end_session()
     teardown()
 ```
 
-The `wrap(...)` facade can auto‑enable taps via `enable_record_taps=True`.
+- The `wrap(...)` facade auto‑enables record taps with `enable_record_taps=True` and管理 the session lifecycle for you.
+- When not using `wrap(...)`, prefer `begin_recording_session(...)` to avoid any cross‑run leakage; global fallbacks are removed in dev.
 
 Telemetry
 ---------
@@ -223,6 +262,7 @@ Examples
 --------
 
 - Example LangGraph factory: `examples/langgraph_demo/app.py` provides `make_graph()` for quick `--app` usage in CLI.
+- CLI implementation: the console entrypoint is `timewarp.cli:main`, which dispatches to a decomposed CLI package under `timewarp/cli/` (commands/helpers). Commands remain stable across versions.
 - Freeze-time example: `examples/langgraph_demo/time_freeze_app.py` provides `make_graph_time()` that writes `timewarp.determinism.now()` into state so you can verify identical timestamps on replay with `--freeze-time`.
 - Parallel branches example: `examples/langgraph_demo/parallel_app.py` demonstrates fan-out and join with DECISION anchors.
 
@@ -396,7 +436,15 @@ Programmatic replay:
 from timewarp.replay import LangGraphReplayer
 
 replayer = LangGraphReplayer(graph=my_graph, store=store)
-session = replayer.resume(run_id, from_step=None, thread_id="t-1", install_wrappers=installer, freeze_time=True)
+from timewarp.adapters.installers import bind_langgraph_playback
+
+# Define an installer with the standard 3‑arg signature
+def installer(llm, tool, memory) -> None:
+    bind_langgraph_playback(my_graph, llm, tool, memory)
+
+session = replayer.resume(
+    run_id, from_step=None, thread_id="t-1", install_wrappers=installer, freeze_time=True
+)
 ```
 
 CLI replay with frozen time:
@@ -446,3 +494,16 @@ OpenTelemetry Quickstart
 ------------------------
 
 See `docs/otel-quickstart.md` for a minimal setup to emit spans per event and link replay spans to recorded ones.
+
+CLI Internals (Contributors)
+----------------------------
+
+- Entry point: `timewarp.cli:main` dispatches to a decomposed CLI under `timewarp/cli/`.
+- Commands: `timewarp/cli/commands/*` implement subcommands (list, events, tools, diff, resume, inject, export, fsck, debug).
+- Helpers: `timewarp/cli/helpers/*` contains small utilities used by the CLI only:
+  - `jsonio`: `print_json`, `dumps_text`, `loads_file` (orjson‑backed).
+  - `state`: `format_state_pretty`, `dump_event_output_to_file`.
+  - `events`: `filter_events`.
+  - `filters`: `parse_list_filters`.
+- Stability: these helper modules are implementation details for the CLI and are not part of the public API; they may change between versions.
+- Programmatic use: prefer the core modules and top‑level exports (`timewarp.events`, `timewarp.store`, `timewarp.diff`, `timewarp.replay`, `timewarp.adapters.langgraph`, etc.).

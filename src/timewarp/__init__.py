@@ -3,6 +3,17 @@
 Exposes core types and factories for event-sourced recording and deterministic replay.
 """
 
+try:  # best-effort: avoid import errors for source checkouts
+    from importlib.metadata import PackageNotFoundError as _PkgNotFound
+    from importlib.metadata import version as _pkg_version
+
+    try:
+        __version__ = _pkg_version("timewarp-llm")
+    except _PkgNotFound:  # pragma: no cover - occurs in editable/source contexts
+        __version__ = "0+unknown"
+except Exception:  # pragma: no cover - extremely defensive
+    __version__ = "0+unknown"
+
 from .codec import from_bytes, to_bytes, zstd_compress, zstd_decompress
 from .determinism import SystemTimeProvider, TimeProvider, restore_rng, snapshot_rng
 from .diff import make_anchor_key, realign_by_anchor
@@ -33,6 +44,7 @@ __all__ = [
     "SchemaMismatch",
     "SystemTimeProvider",
     "TimeProvider",
+    "__version__",
     "from_bytes",
     "make_anchor_key",
     "messages_pruner",

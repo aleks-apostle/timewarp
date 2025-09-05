@@ -25,7 +25,6 @@ from ..replay import PlaybackLLM, PlaybackMemory, PlaybackTool
 
 # --- Staging queues for record-time taps ---
 # New: session-scoped staging via ContextVar to avoid cross-run leakage.
-# We keep process-global deques as a fallback for legacy behavior.
 
 
 @dataclass
@@ -38,10 +37,7 @@ class _RecordingSession:
 
 _SESSION: ContextVar[_RecordingSession | None] = ContextVar("tw_recording_session", default=None)
 
-# Legacy globals (fallback only when no active session)
-_STAGED_PROMPTS: deque[str] = deque()
-_STAGED_TOOLARGS: deque[str] = deque()
-_STAGED_MEMTAPS: deque[dict[str, Any]] = deque()
+# Legacy global fallbacks removed: require an active recording session
 
 
 def begin_recording_session(run_id: UUID) -> Callable[[], None]:
@@ -65,42 +61,34 @@ def begin_recording_session(run_id: UUID) -> Callable[[], None]:
 
 def stage_prompt_hash(h: str) -> None:
     sess = _SESSION.get()
-    if sess is not None:
-        sess.prompts.append(h)
+    if sess is None:
         return
-    _STAGED_PROMPTS.append(h)
+    sess.prompts.append(h)
 
 
 def stage_tool_args_hash(h: str) -> None:
     sess = _SESSION.get()
-    if sess is not None:
-        sess.toolargs.append(h)
+    if sess is None:
         return
-    _STAGED_TOOLARGS.append(h)
+    sess.toolargs.append(h)
 
 
 def try_pop_prompt_hash() -> str | None:
     sess = _SESSION.get()
-    if sess is not None:
-        try:
-            return sess.prompts.popleft()
-        except Exception:
-            return None
+    if sess is None:
+        return None
     try:
-        return _STAGED_PROMPTS.popleft()
+        return sess.prompts.popleft()
     except Exception:
         return None
 
 
 def try_pop_tool_args_hash() -> str | None:
     sess = _SESSION.get()
-    if sess is not None:
-        try:
-            return sess.toolargs.popleft()
-        except Exception:
-            return None
+    if sess is None:
+        return None
     try:
-        return _STAGED_TOOLARGS.popleft()
+        return sess.toolargs.popleft()
     except Exception:
         return None
 
@@ -425,10 +413,9 @@ def stage_memory_tap(env: dict[str, Any]) -> None:
             return
         payload = dict(env)  # shallow copy
         sess = _SESSION.get()
-        if sess is not None:
-            sess.memtaps.append(payload)
-        else:
-            _STAGED_MEMTAPS.append(payload)
+        if sess is None:
+            return
+        sess.memtaps.append(payload)
     except Exception:
         # best-effort
         return
@@ -442,22 +429,14 @@ def try_pop_memory_taps(max_items: int = 1000) -> list[dict[str, Any]]:
     """
     out: list[dict[str, Any]] = []
     sess = _SESSION.get()
-    if sess is not None:
-        try:
-            n = 0
-            while sess.memtaps and n < max_items:
-                out.append(sess.memtaps.popleft())
-                n += 1
-        except Exception:
-            pass
+    if sess is None:
         return out
     try:
-        n2 = 0
-        while _STAGED_MEMTAPS and n2 < max_items:
-            out.append(_STAGED_MEMTAPS.popleft())
-            n2 += 1
+        n = 0
+        while sess.memtaps and n < max_items:
+            out.append(sess.memtaps.popleft())
+            n += 1
     except Exception:
-        # Leave remaining items for next pass
         pass
     return out
 
