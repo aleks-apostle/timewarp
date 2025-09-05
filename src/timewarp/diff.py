@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import difflib
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from deepdiff import DeepDiff
-
 from .codec import from_bytes
 from .events import Event, redact
 from .store import LocalStore
+from .utils.diffing import struct_diff as _struct_diff
+from .utils.diffing import text_unified as _text_unified
+from .utils.diffing import to_text as _to_text
 
 
 @dataclass
@@ -24,8 +24,9 @@ class Divergence:
 def make_anchor_key(ev: Event) -> tuple[Any, Any] | tuple[Any, Any, Any, Any, Any | None]:
     """Compute a comparable anchor key for an event.
 
-    Prefers explicit `anchor_id` label when present; otherwise falls back to a
-    tuple of (action_type, actor, namespace, thread_id, prompt_hash?)
+    Keep aligned with `adapters.langgraph.anchors.make_anchor_id`.
+    Prefers explicit `labels["anchor_id"]` when present; otherwise falls back
+    to a tuple of (action_type, actor, namespace, thread_id, prompt_hash?).
     """
     # Prefer explicit anchor_id when present for robust alignment
     if ev.labels and "anchor_id" in ev.labels:
@@ -142,15 +143,12 @@ def first_divergence(
             try:
                 pa = _load_redacted_output(store, a, b)
                 pb = _load_redacted_output(store, b, a)
-                if isinstance(pa, dict | list) and isinstance(pb, dict | list):
-                    dd = DeepDiff(pa, pb, ignore_order=False)
-                    struct = dict(dd)
-                else:
+                # Prefer structural diff when both sides are JSON-like
+                struct = _struct_diff(pa, pb)
+                if not struct:
                     ta = _to_text(pa)
                     tb = _to_text(pb)
-                    text = "\n".join(
-                        difflib.unified_diff(ta.splitlines(), tb.splitlines(), lineterm="")
-                    )
+                    text = _text_unified(ta, tb)
             except Exception:
                 pass
             return Divergence(
@@ -194,14 +192,7 @@ def _load_redacted_output(store: LocalStore, ev: Event, other: Event | None = No
     return obj
 
 
-def _to_text(obj: Any) -> str:
-    if obj is None:
-        return ""
-    if isinstance(obj, dict | list):
-        from .codec import to_bytes
-
-        return to_bytes(obj).decode("utf-8")
-    return str(obj)
+## Use to_text from utils.diffing via imported alias _to_text
 
 
 def bisect_divergence(

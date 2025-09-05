@@ -20,7 +20,7 @@ def test_fork_creates_branch_run_with_label(tmp_path: Path) -> None:
     graph = _DummyGraph()
     replayer = LangGraphReplayer(graph=graph, store=store)
 
-    def installer(_llm: object, _tool: object) -> None:
+    def installer(_llm: object, _tool: object, _memory: object) -> None:
         # no-op binding in test
         return None
 

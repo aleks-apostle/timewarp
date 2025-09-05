@@ -4,7 +4,7 @@ from pathlib import Path
 
 import orjson as _orjson
 
-from timewarp.cli import dump_event_output_to_file
+from timewarp.cli.helpers.state import dump_event_output_to_file
 from timewarp.events import ActionType, BlobKind, Event, Run
 from timewarp.store import LocalStore
 

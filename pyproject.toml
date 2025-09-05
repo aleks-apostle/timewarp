@@ -1,10 +1,10 @@
 [project]
-name = "timewarp"
+name = "timewarp-llm"
 version = "0.1.0"
 description = "Event-sourced recording + deterministic replay + time‑travel debugger for LLM agents."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "Apache-2.0"
 authors = [
     { name = "Timewarp maintainers" },
 ]
@@ -35,10 +35,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/timewarp"
-Repository = "https://github.com/your-org/timewarp"
-Issues = "https://github.com/your-org/timewarp/issues"
-Changelog = "https://github.com/your-org/timewarp/releases"
+Homepage = "https://github.com/aleks-apostle/timewarp"
+Repository = "https://github.com/aleks-apostle/timewarp"
+Issues = "https://github.com/aleks-apostle/timewarp/issues"
+Changelog = "https://github.com/aleks-apostle/timewarp/releases"
 
 [dependency-groups]
 dev = [
@@ -68,6 +68,16 @@ dev = [
     "langgraph>=0.6",
     "langchain-core>=0.3",
 ]
+examples = [
+    # Ensure example apps import and run
+    "langgraph>=0.6; python_version>='3.10'",
+    "langchain-core>=0.3; python_version>='3.10'",
+]
+# Best-effort MCP adapters (example uses it when available). Not installed by default.
+mcp = [
+    # Some environments may not have this package; keep optional
+    "langchain-mcp-adapters>=0.1; python_version>='3.10'",
+]
 
 [project.scripts]
 timewarp = "timewarp.cli:main"
@@ -84,6 +94,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["timewarp*"]
+
+[tool.setuptools.package-data]
+timewarp = ["py.typed"]
 
 [tool.ruff]
 line-length = 100

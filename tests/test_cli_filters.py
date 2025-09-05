@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from timewarp.cli import _filter_events, _parse_list_filters
+from timewarp.cli.helpers.events import filter_events
+from timewarp.cli.helpers.filters import parse_list_filters
 from timewarp.events import ActionType, Event
 
 
@@ -16,8 +17,8 @@ def test_parse_and_filter_events() -> None:
         _evt(1, ActionType.LLM, "compose", {"thread_id": "t1", "namespace": "a"}),
         _evt(2, ActionType.TOOL, "tooler", {"thread_id": "t2", "namespace": "b"}),
     ]
-    filters = _parse_list_filters(["type=LLM", "node=compose", "thread=t1"])  # type: ignore[arg-type]
-    out = _filter_events(
+    filters = parse_list_filters(["type=LLM", "node=compose", "thread=t1"])  # type: ignore[arg-type]
+    out = filter_events(
         events,
         etype=filters.get("type"),
         node=filters.get("node"),
