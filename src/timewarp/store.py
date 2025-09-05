@@ -7,11 +7,121 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from .codec import zstd_compress, zstd_decompress
 from .events import BlobKind, BlobRef, Event, Run, hash_bytes
 from .telemetry import record_event_span
+
+# Event table column order used by INSERTs/SELECTs.
+_EVENT_COLS = (
+    "run_id, step, action_type, actor, input_ref, output_ref, ts, rng_state, "
+    "model_meta, hashes, parent_step, labels, privacy_marks, schema_version, "
+    "tool_kind, tool_name, mcp_server, mcp_transport, tools_digest, mem_op, "
+    "mem_scope, mem_space, mem_provider, query_id, retriever, top_k"
+)
+
+_NUM_EVENT_COLS = _EVENT_COLS.count(",") + 1
+
+
+def _event_to_db_tuple(ev: Event) -> tuple[object, ...]:
+    """Map Event to a DB tuple matching the INSERT column order."""
+    return (
+        str(ev.run_id),
+        ev.step,
+        ev.action_type.value,
+        ev.actor,
+        ev.input_ref.model_dump_json() if ev.input_ref else None,
+        ev.output_ref.model_dump_json() if ev.output_ref else None,
+        ev.ts.isoformat(),
+        ev.rng_state,
+        json.dumps(ev.model_meta) if ev.model_meta else None,
+        json.dumps(ev.hashes),
+        ev.parent_step,
+        json.dumps(ev.labels),
+        json.dumps(ev.privacy_marks),
+        ev.schema_version,
+        ev.tool_kind,
+        ev.tool_name,
+        ev.mcp_server,
+        ev.mcp_transport,
+        ev.tools_digest,
+        ev.mem_op,
+        ev.mem_scope,
+        ev.mem_space,
+        ev.mem_provider,
+        ev.query_id,
+        ev.retriever,
+        ev.top_k,
+    )
+
+
+def _row_to_event(row: tuple[Any, ...]) -> Event:
+    """Map a SELECT row (ordered by _EVENT_COLS) to an Event."""
+    (
+        run_id_s,
+        step,
+        action_type,
+        actor,
+        input_ref,
+        output_ref,
+        ts,
+        rng_state,
+        model_meta,
+        hashes,
+        parent_step,
+        labels,
+        privacy_marks,
+        schema_version,
+        tool_kind,
+        tool_name,
+        mcp_server,
+        mcp_transport,
+        tools_digest,
+        mem_op,
+        mem_scope,
+        mem_space,
+        mem_provider,
+        query_id,
+        retriever,
+        top_k,
+    ) = row
+
+    def parse_blob(s: str | None) -> BlobRef | None:
+        if not s:
+            return None
+        return BlobRef.model_validate_json(s)
+
+    return Event(
+        run_id=UUID(run_id_s),
+        step=step,
+        action_type=action_type,
+        actor=actor,
+        input_ref=parse_blob(input_ref),
+        output_ref=parse_blob(output_ref),
+        ts=datetime_from_iso(ts),
+        rng_state=rng_state,
+        model_meta=json.loads(model_meta) if model_meta else None,
+        hashes=json.loads(hashes) if hashes else {},
+        parent_step=parent_step,
+        labels=json.loads(labels) if labels else {},
+        privacy_marks=json.loads(privacy_marks) if privacy_marks else {},
+        schema_version=schema_version,
+        tool_kind=tool_kind,
+        tool_name=tool_name,
+        mcp_server=mcp_server,
+        mcp_transport=mcp_transport,
+        tools_digest=tools_digest,
+        mem_op=mem_op,
+        mem_scope=mem_scope,
+        mem_space=mem_space,
+        mem_provider=mem_provider,
+        query_id=query_id,
+        retriever=retriever,
+        top_k=top_k,
+    )
+
 
 _DDL = """
 PRAGMA journal_mode=WAL;
@@ -197,57 +307,19 @@ class LocalStore:
                     ev_to_store = ev
             # Ensure referenced blobs are finalized on disk before inserting event
             try:
-                if ev_to_store.input_ref is not None:
-                    self._finalize_blob_file(ev_to_store.input_ref)
-                if ev_to_store.output_ref is not None:
-                    self._finalize_blob_file(ev_to_store.output_ref)
+                self._finalize_if_tmp(ev_to_store.input_ref)
+                self._finalize_if_tmp(ev_to_store.output_ref)
             except Exception:
                 # propagate after closing span context to avoid masking tracing
                 raise
             with self._conn() as con:
                 con.execute(
-                    """
-                INSERT INTO events (
-                  run_id, step, action_type, actor, input_ref, output_ref, ts, rng_state,
-                  model_meta, hashes, parent_step, labels, privacy_marks, schema_version,
-                  tool_kind, tool_name, mcp_server, mcp_transport,
-                  tools_digest, mem_op, mem_scope, mem_space,
-                  mem_provider, query_id, retriever, top_k
-                ) VALUES (
-                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?
-                )
-                """,
                     (
-                        str(ev_to_store.run_id),
-                        ev_to_store.step,
-                        ev_to_store.action_type.value,
-                        ev_to_store.actor,
-                        ev_to_store.input_ref.model_dump_json() if ev_to_store.input_ref else None,
-                        ev_to_store.output_ref.model_dump_json()
-                        if ev_to_store.output_ref
-                        else None,
-                        ev_to_store.ts.isoformat(),
-                        ev_to_store.rng_state,
-                        json.dumps(ev_to_store.model_meta) if ev_to_store.model_meta else None,
-                        json.dumps(ev_to_store.hashes),
-                        ev_to_store.parent_step,
-                        json.dumps(ev_to_store.labels),
-                        json.dumps(ev_to_store.privacy_marks),
-                        ev_to_store.schema_version,
-                        ev_to_store.tool_kind,
-                        ev_to_store.tool_name,
-                        ev_to_store.mcp_server,
-                        ev_to_store.mcp_transport,
-                        ev_to_store.tools_digest,
-                        ev_to_store.mem_op,
-                        ev_to_store.mem_scope,
-                        ev_to_store.mem_space,
-                        ev_to_store.mem_provider,
-                        ev_to_store.query_id,
-                        ev_to_store.retriever,
-                        ev_to_store.top_k,
+                        f"INSERT INTO events ({_EVENT_COLS}) VALUES ("
+                        + ",".join(["?"] * _NUM_EVENT_COLS)
+                        + ")"
                     ),
+                    _event_to_db_tuple(ev_to_store),
                 )
 
     def append_events(self, events: list[Event]) -> None:
@@ -272,137 +344,25 @@ class LocalStore:
                         except Exception:
                             ev_to_store = ev
                     # Ensure referenced blobs are finalized on disk before inserting event
-                    if ev_to_store.input_ref is not None:
-                        self._finalize_blob_file(ev_to_store.input_ref)
-                    if ev_to_store.output_ref is not None:
-                        self._finalize_blob_file(ev_to_store.output_ref)
+                    self._finalize_if_tmp(ev_to_store.input_ref)
+                    self._finalize_if_tmp(ev_to_store.output_ref)
                     con.execute(
-                        """
-                    INSERT INTO events (
-                      run_id, step, action_type, actor, input_ref, output_ref, ts, rng_state,
-                      model_meta, hashes, parent_step, labels, privacy_marks, schema_version,
-                      tool_kind, tool_name, mcp_server, mcp_transport,
-                      tools_digest, mem_op, mem_scope, mem_space,
-                      mem_provider, query_id, retriever, top_k
-                    ) VALUES (
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?
-                    )
-                    """,
                         (
-                            str(ev_to_store.run_id),
-                            ev_to_store.step,
-                            ev_to_store.action_type.value,
-                            ev_to_store.actor,
-                            ev_to_store.input_ref.model_dump_json()
-                            if ev_to_store.input_ref
-                            else None,
-                            ev_to_store.output_ref.model_dump_json()
-                            if ev_to_store.output_ref
-                            else None,
-                            ev_to_store.ts.isoformat(),
-                            ev_to_store.rng_state,
-                            json.dumps(ev_to_store.model_meta) if ev_to_store.model_meta else None,
-                            json.dumps(ev_to_store.hashes),
-                            ev_to_store.parent_step,
-                            json.dumps(ev_to_store.labels),
-                            json.dumps(ev_to_store.privacy_marks),
-                            ev_to_store.schema_version,
-                            ev_to_store.tool_kind,
-                            ev_to_store.tool_name,
-                            ev_to_store.mcp_server,
-                            ev_to_store.mcp_transport,
-                            ev_to_store.tools_digest,
-                            ev_to_store.mem_op,
-                            ev_to_store.mem_scope,
-                            ev_to_store.mem_space,
-                            ev_to_store.mem_provider,
-                            ev_to_store.query_id,
-                            ev_to_store.retriever,
-                            ev_to_store.top_k,
+                            f"INSERT INTO events ({_EVENT_COLS}) VALUES ("
+                            + ",".join(["?"] * _NUM_EVENT_COLS)
+                            + ")"
                         ),
+                        _event_to_db_tuple(ev_to_store),
                     )
 
     def list_events(self, run_id: UUID) -> list[Event]:
         with self._conn() as con:
             cur = con.execute(
-                (
-                    "SELECT run_id, step, action_type, actor, input_ref, output_ref, ts, "
-                    "rng_state, model_meta, hashes, parent_step, labels, privacy_marks, "
-                    "schema_version, tool_kind, tool_name, mcp_server, mcp_transport, "
-                    "tools_digest, mem_op, mem_scope, mem_space, mem_provider, query_id, "
-                    "retriever, top_k FROM events WHERE run_id=? ORDER BY step ASC"
-                ),
+                (f"SELECT {_EVENT_COLS} FROM events WHERE run_id=? ORDER BY step ASC"),
                 (str(run_id),),
             )
             rows = cur.fetchall()
-        events: list[Event] = []
-        for r in rows:
-            (
-                run_id_s,
-                step,
-                action_type,
-                actor,
-                input_ref,
-                output_ref,
-                ts,
-                rng_state,
-                model_meta,
-                hashes,
-                parent_step,
-                labels,
-                privacy_marks,
-                schema_version,
-                tool_kind,
-                tool_name,
-                mcp_server,
-                mcp_transport,
-                tools_digest,
-                mem_op,
-                mem_scope,
-                mem_space,
-                mem_provider,
-                query_id,
-                retriever,
-                top_k,
-            ) = r
-
-            def parse_blob(s: str | None) -> BlobRef | None:
-                if not s:
-                    return None
-                return BlobRef.model_validate_json(s)
-
-            events.append(
-                Event(
-                    run_id=UUID(run_id_s),
-                    step=step,
-                    action_type=action_type,
-                    actor=actor,
-                    input_ref=parse_blob(input_ref),
-                    output_ref=parse_blob(output_ref),
-                    ts=datetime_from_iso(ts),
-                    rng_state=rng_state,
-                    model_meta=json.loads(model_meta) if model_meta else None,
-                    hashes=json.loads(hashes) if hashes else {},
-                    parent_step=parent_step,
-                    labels=json.loads(labels) if labels else {},
-                    privacy_marks=json.loads(privacy_marks) if privacy_marks else {},
-                    schema_version=schema_version,
-                    tool_kind=tool_kind,
-                    tool_name=tool_name,
-                    mcp_server=mcp_server,
-                    mcp_transport=mcp_transport,
-                    tools_digest=tools_digest,
-                    mem_op=mem_op,
-                    mem_scope=mem_scope,
-                    mem_space=mem_space,
-                    mem_provider=mem_provider,
-                    query_id=query_id,
-                    retriever=retriever,
-                    top_k=top_k,
-                )
-            )
-        return events
+        return [_row_to_event(r) for r in rows]
 
     def list_events_window(self, run_id: UUID, offset: int, limit: int) -> list[Event]:
         """Return a window of events ordered by step (offset/limit).
@@ -414,82 +374,13 @@ class LocalStore:
         with self._conn() as con:
             cur = con.execute(
                 (
-                    "SELECT run_id, step, action_type, actor, input_ref, output_ref, ts, "
-                    "rng_state, model_meta, hashes, parent_step, labels, privacy_marks, "
-                    "schema_version, tool_kind, tool_name, mcp_server, mcp_transport, "
-                    "tools_digest, mem_op, mem_scope, mem_space, mem_provider, query_id, "
-                    "retriever, top_k FROM events WHERE run_id=? ORDER BY step ASC LIMIT ? OFFSET ?"
+                    f"SELECT {_EVENT_COLS} FROM events WHERE run_id=? "
+                    "ORDER BY step ASC LIMIT ? OFFSET ?"
                 ),
                 (str(run_id), lim, off),
             )
             rows = cur.fetchall()
-        events: list[Event] = []
-        for r in rows:
-            (
-                run_id_s,
-                step,
-                action_type,
-                actor,
-                input_ref,
-                output_ref,
-                ts,
-                rng_state,
-                model_meta,
-                hashes,
-                parent_step,
-                labels,
-                privacy_marks,
-                schema_version,
-                tool_kind,
-                tool_name,
-                mcp_server,
-                mcp_transport,
-                tools_digest,
-                mem_op,
-                mem_scope,
-                mem_space,
-                mem_provider,
-                query_id,
-                retriever,
-                top_k,
-            ) = r
-
-            def parse_blob(s: str | None) -> BlobRef | None:
-                if not s:
-                    return None
-                return BlobRef.model_validate_json(s)
-
-            events.append(
-                Event(
-                    run_id=UUID(run_id_s),
-                    step=step,
-                    action_type=action_type,
-                    actor=actor,
-                    input_ref=parse_blob(input_ref),
-                    output_ref=parse_blob(output_ref),
-                    ts=datetime_from_iso(ts),
-                    rng_state=rng_state,
-                    model_meta=json.loads(model_meta) if model_meta else None,
-                    hashes=json.loads(hashes) if hashes else {},
-                    parent_step=parent_step,
-                    labels=json.loads(labels) if labels else {},
-                    privacy_marks=json.loads(privacy_marks) if privacy_marks else {},
-                    schema_version=schema_version,
-                    tool_kind=tool_kind,
-                    tool_name=tool_name,
-                    mcp_server=mcp_server,
-                    mcp_transport=mcp_transport,
-                    tools_digest=tools_digest,
-                    mem_op=mem_op,
-                    mem_scope=mem_scope,
-                    mem_space=mem_space,
-                    mem_provider=mem_provider,
-                    query_id=query_id,
-                    retriever=retriever,
-                    top_k=top_k,
-                )
-            )
-        return events
+        return [_row_to_event(r) for r in rows]
 
     def count_events(self, run_id: UUID) -> int:
         with self._conn() as con:
@@ -562,6 +453,15 @@ class LocalStore:
             return
         # Nothing to finalize; report missing file
         raise FileNotFoundError(str(final_path))
+
+    def _finalize_if_tmp(self, ref: BlobRef | None) -> None:
+        """Finalize referenced blob if present.
+
+        No-op when ref is None. Uses the store's blob root for resolution.
+        """
+        if ref is None:
+            return
+        self._finalize_blob_file(ref)
 
 
 def datetime_from_iso(s: str) -> datetime:
