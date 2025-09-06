@@ -87,6 +87,8 @@ Run an optimizer (requires installing the `dspy` extra):
 timewarp ./timewarp.sqlite3 ./blobs dspy optimize ds.json --optimizer bootstrap --out prompts.json
 # or
 timewarp ./timewarp.sqlite3 ./blobs dspy optimize ds.json --optimizer mipro --out prompts.json
+# emit overrides JSON directly consumable by `dspy fork`
+timewarp ./timewarp.sqlite3 ./blobs dspy optimize ds.json --emit-overrides --out overrides.json
 ```
 
 Notes

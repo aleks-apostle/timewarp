@@ -149,6 +149,34 @@ def _handler_optimize(args: argparse.Namespace, _store: LocalStore) -> int:
                     "metrics": {"examples": len(exs)},
                 }
 
+    # Optional: emit overrides mapping directly consumable by `dspy fork`
+    if bool(getattr(args, "emit_overrides", False)):
+        overrides: dict[str, Any] = {}
+        for agent, exs in data.items():
+            try:
+                # Prefer an explicit prompt_template from the results when present
+                val = (
+                    results.get("agents", {}).get(agent, {})
+                    if isinstance(results.get("agents"), dict)
+                    else {}
+                )
+                pt = val.get("prompt_template") if isinstance(val, dict) else None
+                if isinstance(pt, str) and pt:
+                    overrides[str(agent)] = pt
+                else:
+                    # Fallback to heuristic prompt construction from dataset examples
+                    if isinstance(exs, list):
+                        overrides[str(agent)] = _heuristic_prompt_for_agent(str(agent), exs)
+            except Exception:
+                continue
+        out = getattr(args, "out", None)
+        if out:
+            Path(out).write_text(dumps_text(overrides), encoding="utf-8")
+            print(f"Wrote overrides to {out}")
+            return 0
+        print_json(overrides)
+        return 0
+
     out = getattr(args, "out", None)
     if out:
         Path(out).write_text(dumps_text(results), encoding="utf-8")
@@ -177,5 +205,232 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
         choices=["none", "bootstrap", "mipro"],
         help="Optimizer to use (requires DSPy for bootstrap/mipro)",
     )
+    opt.add_argument(
+        "--emit-overrides",
+        dest="emit_overrides",
+        action="store_true",
+        help="Emit agent->override JSON directly usable by 'dspy fork'",
+    )
     opt.add_argument("--out", dest="out", default=None, help="Path to write prompts JSON")
     opt.set_defaults(func=_handler_optimize)
+
+    # --- fork with prompt overrides ---
+    def _handler_fork(args: argparse.Namespace, store: LocalStore) -> int:
+        # Load overrides spec (JSON)
+        from importlib import import_module
+
+        from ...adapters import installers as _installers
+        from ...events import Run as _Run
+        from ...replay import LangGraphReplayer
+
+        try:
+            spec = loads_file(Path(args.overrides))
+            if not isinstance(spec, dict):
+                print("Invalid overrides file: expected object mapping agent -> spec")
+                return 1
+        except Exception as exc:
+            print("Failed to read overrides:", exc)
+            return 1
+
+        # Build prompt adapters from spec
+        def _build_adapter(item: Any) -> Any:
+            # Returns a Callable[[Any], Any]
+            def _identity(x: Any) -> Any:
+                return x
+
+            if isinstance(item, str):
+                text = item
+
+                def _adapter(x: Any) -> Any:
+                    if isinstance(x, list):
+                        # Prepend a system message
+                        return [{"role": "system", "content": text}, *list(x)]
+                    if isinstance(x, str):
+                        return str(x) + "\n\n" + text
+                    return x
+
+                return _adapter
+            if isinstance(item, dict):
+                mode = str(item.get("mode", "prepend_system")).lower()
+                text = str(item.get("text", ""))
+
+                def _adapter(x: Any) -> Any:
+                    if isinstance(x, list):
+                        msgs = list(x)
+                        if mode == "append_system":
+                            msgs = [*msgs, {"role": "system", "content": text}]
+                        elif mode == "replace_system":
+                            replaced = False
+                            out = []
+                            for m in msgs:
+                                if (
+                                    not replaced
+                                    and isinstance(m, dict)
+                                    and m.get("role") == "system"
+                                ):
+                                    out.append({"role": "system", "content": text})
+                                    replaced = True
+                                else:
+                                    out.append(m)
+                            msgs = (
+                                out if replaced else ([{"role": "system", "content": text}, *out])
+                            )
+                        else:  # prepend_system (default)
+                            msgs = [{"role": "system", "content": text}, *msgs]
+                        return msgs
+                    if isinstance(x, str):
+                        if mode in {"append_prompt", "append_system"}:
+                            return str(x) + "\n\n" + text
+                        elif mode == "replace_prompt":
+                            return text
+                        else:  # prepend_system / prepend_prompt
+                            return text + "\n\n" + str(x)
+                    return x
+
+                return _adapter
+            return _identity
+
+        prompt_overrides = {
+            str(agent): _build_adapter(spec_val) for agent, spec_val in spec.items()
+        }
+
+        # Import app factory
+        try:
+            mod_name, func_name = args.app_factory.split(":", 1)
+            mod = import_module(mod_name)
+            factory = getattr(mod, func_name)
+            graph = factory()
+        except Exception as exc:  # pragma: no cover
+            print("Failed to import app factory:", exc)
+            return 1
+
+        teardowns: list[Any] = []
+
+        def installer(llm: Any, tool: Any, memory: Any) -> None:
+            try:
+                # Honor strict_meta on wrappers
+                try:
+                    llm.strict_meta = bool(args.strict_meta)
+                    tool.strict_meta = bool(args.strict_meta)
+                    # Allow prompt hash diffs per flag (defaults to False)
+                    llm.allow_diff = bool(getattr(args, "allow_diff", False))
+                    # Thread prompt overrides explicitly
+                    llm.prompt_overrides = dict(prompt_overrides)
+                except Exception:
+                    pass
+                td = _installers.bind_langgraph_playback(
+                    graph, llm, tool, memory, prompt_overrides=prompt_overrides
+                )
+                teardowns.append(td)
+            except Exception as exc:  # pragma: no cover
+                print("Warning: failed to bind playback wrappers:", exc)
+
+        replayer = LangGraphReplayer(graph=graph, store=store)
+        new_id = replayer.fork_with_prompt_overrides(
+            UUID(args.run_id),
+            prompt_overrides,
+            args.thread_id,
+            install_wrappers=installer,
+            freeze_time=bool(getattr(args, "freeze_time", False)),
+            allow_diff=bool(getattr(args, "allow_diff", False)),
+        )
+
+        # Optionally execute and record the fork
+        if bool(getattr(args, "record_fork", False)):
+            try:
+                # Retrieve original input payload
+                evs = store.list_events(UUID(args.run_id))
+                orig_input = None
+                for ev in evs:
+                    if ev.input_ref is not None:
+                        from ...codec import from_bytes as _from_bytes
+
+                        orig_input = _from_bytes(store.get_blob(ev.input_ref))
+                        break
+                if orig_input is None:
+                    print("Could not locate original input for the run; aborting fork recording")
+                    return 1
+                # Compose new Run metadata: branch_of + override_step
+                proj = None
+                name = None
+                for r in store.list_runs():
+                    if r.run_id == UUID(args.run_id):
+                        proj = r.project
+                        name = r.name
+                        break
+                new_run = _Run(
+                    run_id=new_id,
+                    project=proj,
+                    name=name,
+                    framework="langgraph",
+                    labels={"branch_of": str(args.run_id), "override_step": "prompt_overrides"},
+                )
+                # Begin a recording session to enable staged hashes from overrides
+                from ...adapters.installers import begin_recording_session
+                from ...adapters.langgraph import LangGraphRecorder as _LGRecorder
+
+                end_session = begin_recording_session(new_run.run_id)
+                try:
+                    store.create_run(new_run)
+                    rec = _LGRecorder(
+                        graph=graph,
+                        store=store,
+                        run=new_run,
+                        snapshot_every=20,
+                        stream_modes=("updates", "messages", "values"),
+                        stream_subgraphs=True,
+                    )
+                    cfg2: dict[str, object] = {"configurable": {}}
+                    if args.thread_id is not None:
+                        cfg2 = {"configurable": {"thread_id": args.thread_id}}
+                    _ = rec.invoke(orig_input, config=cfg2)
+                finally:
+                    try:
+                        end_session()
+                    except Exception:
+                        pass
+                print("Fork executed and recorded:", new_id)
+                return 0
+            finally:
+                # Teardown playback patches if installed
+                for td in teardowns:
+                    try:
+                        td()
+                    except Exception:
+                        pass
+        else:
+            print("Fork prepared with prompt overrides")
+            print("New run id:", new_id)
+            print(
+                "Note: to record the fork immediately, re-run with --record-fork or "
+                "run your app with the recorder."
+            )
+            return 0
+
+    fork = dsub.add_parser("fork", help="Fork a run applying per-agent prompt overrides")
+    fork.add_argument("run_id", help="Base run ID to fork")
+    fork.add_argument("--app", dest="app_factory", required=True, help="module:function factory")
+    fork.add_argument("--overrides", dest="overrides", required=True, help="Path to overrides JSON")
+    fork.add_argument("--thread", dest="thread_id", default=None, help="LangGraph thread id")
+    fork.add_argument(
+        "--allow-diff",
+        dest="allow_diff",
+        action="store_true",
+        help="Allow prompt hash diffs on replay",
+    )
+    fork.add_argument(
+        "--strict-meta",
+        dest="strict_meta",
+        action="store_true",
+        help="Enforce model meta validation",
+    )
+    fork.add_argument(
+        "--freeze-time", dest="freeze_time", action="store_true", help="Freeze time during replay"
+    )
+    fork.add_argument(
+        "--record-fork",
+        dest="record_fork",
+        action="store_true",
+        help="Execute and record the fork immediately",
+    )
+    fork.set_defaults(func=_handler_fork)
