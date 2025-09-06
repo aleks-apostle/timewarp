@@ -666,9 +666,7 @@ def bind_memory_taps() -> Callable[[], None]:
                                 xi.model_dump()
                                 if hasattr(xi, "model_dump") and callable(xi.model_dump)
                                 else (
-                                    xi.dict()
-                                    if hasattr(xi, "dict") and callable(xi.dict)
-                                    else xi
+                                    xi.dict() if hasattr(xi, "dict") and callable(xi.dict) else xi
                                 )
                             )
                             for xi in res
