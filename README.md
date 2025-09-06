@@ -87,6 +87,8 @@ Run an optimizer (requires installing the `dspy` extra):
 timewarp ./timewarp.sqlite3 ./blobs dspy optimize ds.json --optimizer bootstrap --out prompts.json
 # or
 timewarp ./timewarp.sqlite3 ./blobs dspy optimize ds.json --optimizer mipro --out prompts.json
+# emit overrides JSON directly consumable by `dspy fork`
+timewarp ./timewarp.sqlite3 ./blobs dspy optimize ds.json --emit-overrides --out overrides.json
 ```
 
 Notes
@@ -412,6 +414,58 @@ timewarp ./timewarp.sqlite3 ./blobs inject <run_id> <step> \
   --output alt.json \
   --app examples.langgraph_demo.multi_agent_full:make_graph_multi \
   --thread t-demo --record-fork --freeze-time
+```
+
+Prompt overrides (DSPy-style)
+-----------------------------
+
+Provide a JSON mapping of agent/node name to an override spec. A spec can be a string (treated as a system message or appended to a raw prompt) or an object with a mode and text.
+
+Example overrides.json
+
+```json
+{
+  "planner": { "mode": "prepend_system", "text": "Be concise and accurate." },
+  "review": "Prefer bullet points"
+}
+``
+
+Apply overrides during a non-recorded resume (tolerate prompt-hash diffs with --allow-diff):
+
+```
+timewarp ./timewarp.sqlite3 ./blobs resume <run_id> \
+  --app examples.langgraph_demo.multi_agent_full:make_graph_multi \
+  --thread t-demo \
+  --prompt-overrides ./overrides.json \
+  --allow-diff
+```
+
+Fork and record a branch with overrides using inject:
+
+```
+timewarp ./timewarp.sqlite3 ./blobs inject <run_id> 0 \
+  --prompt-overrides ./overrides.json \
+  --app examples.langgraph_demo.multi_agent_full:make_graph_multi \
+  --thread t-demo \
+  --allow-diff \
+  --record-fork
+```
+
+Or use the dedicated helper:
+
+```
+timewarp ./timewarp.sqlite3 ./blobs dspy fork <run_id> \
+  --app examples.langgraph_demo.multi_agent_full:make_graph_multi \
+  --overrides ./overrides.json \
+  --thread t-demo \
+  --allow-diff \
+  --record-fork
+```
+
+Each forked run is labeled with `branch_of=<baseline>` and `override_step=prompt_overrides`, so you can diff the branch against the baseline:
+
+```
+timewarp ./timewarp.sqlite3 ./blobs diff <baseline_run_id> <fork_run_id> --json
 ```
 
 Event Filters Cheatsheet

@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from .codec import to_bytes
+from .determinism import now as tw_now
 
 
 class ActionType(StrEnum):
@@ -77,7 +78,7 @@ class Event(BaseModel):
     actor: str
     input_ref: BlobRef | None = None
     output_ref: BlobRef | None = None
-    ts: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    ts: datetime = Field(default_factory=tw_now)
     rng_state: bytes | None = None
     model_meta: dict[str, Any] | None = None
     hashes: dict[str, str] = Field(default_factory=dict)
