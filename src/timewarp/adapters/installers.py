@@ -555,6 +555,13 @@ def bind_memory_taps() -> Callable[[], None]:
 
     def _normalize_doc(x: Any) -> Any:
         try:
+            # Prefer Pydantic v2 API when available
+            if hasattr(x, "model_dump") and callable(x.model_dump):
+                return x.model_dump()
+        except Exception:
+            pass
+        try:
+            # Fallback for Pydantic v1 models
             if hasattr(x, "dict") and callable(x.dict):
                 return x.dict()
         except Exception:
@@ -655,7 +662,15 @@ def bind_memory_taps() -> Callable[[], None]:
                     q = args[0] if args else kwargs.get("query")
                     items = (
                         [
-                            (xi.dict() if hasattr(xi, "dict") and callable(xi.dict) else xi)
+                            (
+                                xi.model_dump()
+                                if hasattr(xi, "model_dump") and callable(xi.model_dump)
+                                else (
+                                    xi.dict()
+                                    if hasattr(xi, "dict") and callable(xi.dict)
+                                    else xi
+                                )
+                            )
                             for xi in res
                         ]
                         if isinstance(res, list)
