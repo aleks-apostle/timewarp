@@ -1,6 +1,12 @@
 Timewarp — Deterministic Replay & Time‑Travel Debugger for LLM Agent Workflows
 ==============================================================================
 
+[![PyPI](https://img.shields.io/pypi/v/timewarp-llm.svg)](https://pypi.org/project/timewarp-llm/)
+[![Python Versions](https://img.shields.io/pypi/pyversions/timewarp-llm.svg)](https://pypi.org/project/timewarp-llm/)
+[![License](https://img.shields.io/pypi/l/timewarp-llm.svg)](./LICENSE)
+[![CI](https://github.com/aleks-apostle/timewarp/actions/workflows/ci.yml/badge.svg)](https://github.com/aleks-apostle/timewarp/actions/workflows/ci.yml)
+[![Publish](https://github.com/aleks-apostle/timewarp/actions/workflows/release.yml/badge.svg)](https://github.com/aleks-apostle/timewarp/actions/workflows/release.yml)
+
 Record every step. Rewind any step. Reproduce any run.
 
 Timewarp adds event‑sourced logging and deterministic replay to agent frameworks (LangGraph first, LangChain optional), plus a CLI debugger for step‑through, diffs, and what‑if edits. It fills a well‑documented gap: mainstream tools visualize traces but don’t let you replay them exactly.
@@ -48,18 +54,47 @@ pip install timewarp-llm
 # optional extras
 pip install 'timewarp-llm[adapters]'
 pip install 'timewarp-llm[otel]'
+pip install 'timewarp-llm[dspy]'   # optional DSPy optimizers
 ```
 
 ```
 uv venv && uv pip install -e .[dev]
 ruff format && ruff check --fix
-mypy --strict src
+mypy --strict
 pytest -q
 ```
 
 Optional dependencies
 - Adapters: `uv pip install -e .[adapters]` (installs `langgraph`, `langchain-core`)
 - Telemetry: `uv pip install -e .[otel]` (installs `opentelemetry-*`)
+- DSPy: `uv pip install -e .[dspy]` (installs `dspy`) for optional prompt optimization
+
+DSPy Dataset & Optimization (optional)
+--------------------------------------
+
+Timewarp can export per-agent datasets from recorded runs and optionally run DSPy optimizers
+to produce improved prompt specifications.
+
+Build a dataset from a run:
+
+```
+timewarp ./timewarp.sqlite3 ./blobs dspy build-dataset <run_id> --out ds.json
+```
+
+Run an optimizer (requires installing the `dspy` extra):
+
+```
+timewarp ./timewarp.sqlite3 ./blobs dspy optimize ds.json --optimizer bootstrap --out prompts.json
+# or
+timewarp ./timewarp.sqlite3 ./blobs dspy optimize ds.json --optimizer mipro --out prompts.json
+```
+
+Notes
+- Dataset groups examples by agent (LangGraph node). Each example includes inputs (messages when
+  available), the agent's memory snapshot at `step-1`, the recorded output, and step/thread metadata.
+- Optimizers are optional. If DSPy is not installed or compilation fails, the CLI emits a
+  heuristic prompt template per agent with basic metrics.
+- This is pre‑release functionality and may evolve without backward compatibility guarantees.
 
 Recording a Run (LangGraph)
 ---------------------------
@@ -203,7 +238,7 @@ Notes
 Tools, Prompt, and Memory Views
 -------------------------------
 
-Inspect tools available to the model and tools actually called, plus prompt parts and memory events:
+Inspect tools available to the model, prompts, and memory/retrieval state reconstructed per step and agent:
 
 ```
 # Tools summary across LLM steps
@@ -212,13 +247,18 @@ timewarp ./timewarp.sqlite3 ./blobs tools <run_id>
 # Tools detail for a specific LLM step
 timewarp ./timewarp.sqlite3 ./blobs tools <run_id> --step 42 --json
 
-# Inside the debug REPL
+# Memory snapshots (per agent/space)
+timewarp ./timewarp.sqlite3 ./blobs memory summary <run_id> --step 120
+timewarp ./timewarp.sqlite3 ./blobs memory show <run_id> --step 120 --space planner --json
+timewarp ./timewarp.sqlite3 ./blobs memory diff <run_id> 100 140 --space planner --scope working --key messages.0
+
+# Inside the debug REPL (planned)
 > tools            # summary across LLM steps
 > tools 42         # detail for step 42
 > prompt 42        # prompt parts (messages + tools), hashes, token estimate
-> memory           # list MEMORY/RETRIEVAL events
-> memory show 120  # pretty-print a specific memory/retrieval payload
-> memory diff 120 140 key=items.0  # structural diff; optional dot path
+> memory           # summary by agent at current step
+> memory 120       # snapshot at step 120
+> memory diff 120 140 key=messages.0  # structural diff; optional dot path
 ```
 
 Details
@@ -226,6 +266,25 @@ Details
 - Called tools: correlated by `thread_id` and node, scanning forward until the next LLM event on the same thread.
 - Token estimate: provider-agnostic heuristic (≈ chars/4) to quickly gauge prompt size; for precise tokens/costs integrate a tokenizer.
 - Privacy: printed payloads respect `privacy_marks` redaction.
+
+Capturing LangGraph memory from values
+-------------------------------------
+
+To synthesize memory from LangGraph `values` stream, configure the recorder with `memory_paths`:
+
+```
+from timewarp.adapters.langgraph import LangGraphRecorder
+
+rec = LangGraphRecorder(
+    graph=graph,
+    store=store,
+    run=run,
+    stream_modes=("updates", "values"),
+    memory_paths=("messages", "history", "scratch", "artifacts", "memory"),
+)
+```
+
+Each new/changed key under these paths emits a MEMORY event (`mem_provider="LangGraphState"`) with stable `hashes.item`, `labels.anchor_id`, and inferred `mem_scope` from the path name. The CLI `memory` command reconstructs per-agent snapshots from these events.
 
 Record‑time taps (determinism)
 ------------------------------

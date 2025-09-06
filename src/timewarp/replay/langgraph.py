@@ -195,3 +195,76 @@ class LangGraphReplayer:
             from uuid import uuid4
 
             return uuid4()
+
+    def fork_with_prompt_overrides(
+        self,
+        run_id: UUID,
+        prompt_overrides: dict[str, Callable[[Any], Any]],
+        thread_id: str | None,
+        *,
+        install_wrappers: Callable[[PlaybackLLM, PlaybackTool, PlaybackMemory], None] | None = None,
+        freeze_time: bool = False,
+        allow_diff: bool = True,
+    ) -> UUID:
+        """Prepare a forked run that applies DSPy-style prompt overrides per agent.
+
+        - Installs a PlaybackLLM configured with `prompt_overrides` so that for any
+          LLM event whose labels.node (or actor) matches a key, the adapter is invoked
+          to transform the messages or prompt deterministically.
+        - When `allow_diff` is True (default), prompt/prompt_ctx mismatches against the
+          recorded hashes do not fail replay; instead, the wrapper stages the new hash
+          so the branch recording reflects the override while keeping outputs deterministic.
+
+        Returns the new run_id for the forked branch. The caller is responsible for
+        executing the graph with a recorder bound to the new run id.
+        """
+        events = self.store.list_events(run_id)
+        llm_cursor = _EventCursor(
+            events=events, action_type=ActionType.LLM, start_index=0, thread_id=thread_id
+        )
+        tool_cursor = _EventCursor(
+            events=events, action_type=ActionType.TOOL, start_index=0, thread_id=thread_id
+        )
+        llm = PlaybackLLM(
+            store=self.store,
+            cursor=llm_cursor,
+            freeze_time=freeze_time,
+            prompt_overrides=dict(prompt_overrides or {}),
+            allow_diff=bool(allow_diff),
+        )
+        tool = PlaybackTool(
+            store=self.store,
+            cursor=tool_cursor,
+            freeze_time=freeze_time,
+        )
+        mem_cursor = _EventCursor(
+            events=events, action_type=ActionType.RETRIEVAL, start_index=0, thread_id=thread_id
+        )
+        memory = PlaybackMemory(store=self.store, retrieval_cursor=mem_cursor)
+        memory.freeze_time = freeze_time
+        if install_wrappers is None:
+            raise AdapterInvariant("install_wrappers is required to bind overrides for forking")
+        install_wrappers(llm, tool, memory)
+        # Create a forked Run with branch metadata
+        try:
+            from ..events import Run as _Run
+
+            orig_run: _Run | None = None
+            for r in self.store.list_runs():
+                if r.run_id == run_id:
+                    orig_run = r
+                    break
+            labels = {"branch_of": str(run_id), "override_step": "prompt_overrides"}
+            new_run = _Run(
+                project=orig_run.project if orig_run else None,
+                name=(orig_run.name if orig_run else None),
+                framework=(orig_run.framework if orig_run else None),
+                code_version=(orig_run.code_version if orig_run else None),
+                labels=labels,
+            )
+            self.store.create_run(new_run)
+            return new_run.run_id
+        except Exception:
+            from uuid import uuid4
+
+            return uuid4()

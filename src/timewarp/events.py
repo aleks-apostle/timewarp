@@ -60,7 +60,7 @@ class Run(BaseModel):
     finished_at: datetime | None = None
     status: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
-    schema_version: int = 2
+    schema_version: int = 3
 
 
 class Event(BaseModel):
@@ -84,7 +84,7 @@ class Event(BaseModel):
     parent_step: int | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     privacy_marks: dict[str, str] = Field(default_factory=dict)
-    schema_version: int = 2
+    schema_version: int = 3
 
     # Adapter-specific observational metadata (kept explicit to avoid nesting arbitrary blobs)
     tool_kind: str | None = None  # e.g., "MCP" for MCP tool calls

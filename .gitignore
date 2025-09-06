@@ -29,7 +29,9 @@ SPRINTS/
 timewarp.sqlite3
 timewarp.db
 .github
-LICENSE
+ds.json
+planned-next.md
+publish.md
 
 # Python bytecode and caches
 **/__pycache__/

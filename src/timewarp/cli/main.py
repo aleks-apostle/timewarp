@@ -13,11 +13,13 @@ def _register_commands(sub: argparse._SubParsersAction[argparse.ArgumentParser])
     # Import locally to avoid import-time side effects and optional deps.
     # Debug REPL is not yet modularized; skip if unavailable.
     from .commands import diff as _cmd_diff
+    from .commands import dspy as _cmd_dspy
     from .commands import events as _cmd_events
     from .commands import export as _cmd_export
     from .commands import fsck as _cmd_fsck
     from .commands import inject as _cmd_inject
     from .commands import list_runs as _cmd_list
+    from .commands import memory as _cmd_memory
     from .commands import resume as _cmd_resume
     from .commands import tools as _cmd_tools
 
@@ -29,6 +31,8 @@ def _register_commands(sub: argparse._SubParsersAction[argparse.ArgumentParser])
     _cmd_export.register(sub)
     _cmd_resume.register(sub)
     _cmd_inject.register(sub)
+    _cmd_memory.register(sub)
+    _cmd_dspy.register(sub)
 
 
 def build_parser() -> argparse.ArgumentParser:

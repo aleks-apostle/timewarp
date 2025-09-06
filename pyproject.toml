@@ -24,6 +24,9 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Environment :: Console",
+    "Topic :: Software Development :: Debuggers",
     "Typing :: Typed",
 ]
 dependencies = [
@@ -78,6 +81,10 @@ mcp = [
     # Some environments may not have this package; keep optional
     "langchain-mcp-adapters>=0.1; python_version>='3.10'",
 ]
+"dspy" = [
+    # Optional DSPy optimizers/teleprompters for prompt tuning
+    "dspy>=2.4",
+]
 
 [project.scripts]
 timewarp = "timewarp.cli:main"
@@ -119,3 +126,4 @@ disallow_untyped_defs = true
 no_implicit_optional = true
 strict_optional = true
 mypy_path = ["src"]
+files = ["src"]

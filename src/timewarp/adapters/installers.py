@@ -94,7 +94,12 @@ def try_pop_tool_args_hash() -> str | None:
 
 
 def bind_langgraph_playback(
-    graph: Any, llm: PlaybackLLM, tool: PlaybackTool, memory: PlaybackMemory | None = None
+    graph: Any,
+    llm: PlaybackLLM,
+    tool: PlaybackTool,
+    memory: PlaybackMemory | None = None,
+    *,
+    prompt_overrides: dict[str, Callable[[Any], Any]] | None = None,
 ) -> Callable[[], None]:
     """Bind playback wrappers to common integration points.
 
@@ -116,6 +121,13 @@ def bind_langgraph_playback(
     """
 
     teardowns: list[Callable[[], None]] = []
+
+    # Thread prompt_overrides into the LLM wrapper when provided
+    try:
+        if isinstance(prompt_overrides, dict) and prompt_overrides:
+            llm.prompt_overrides = dict(prompt_overrides)
+    except Exception:
+        pass
 
     # Patch LangChain Chat/Language models (import lazily to avoid mypy issues)
     import importlib
@@ -527,6 +539,107 @@ def bind_memory_taps() -> Callable[[], None]:
                     teardowns.append(undo)
     except Exception:
         pass
+
+    # --- LangChain Retrievers (optional) ---
+    try:  # pragma: no cover - optional dependency
+        import importlib
+
+        lc_ret_mod = importlib.import_module("langchain_core.retrievers")
+        BaseRetriever = getattr(lc_ret_mod, "BaseRetriever", None)
+        if BaseRetriever is None:
+            # Older/newer path
+            lc_ret_mod2 = importlib.import_module("langchain_core.retrievers.base")
+            BaseRetriever = getattr(lc_ret_mod2, "BaseRetriever", None)
+    except Exception:
+        BaseRetriever = None
+
+    def _normalize_doc(x: Any) -> Any:
+        try:
+            if hasattr(x, "dict") and callable(x.dict):
+                return x.dict()
+        except Exception:
+            pass
+        try:
+            # Common LangChain Document shape
+            pc = getattr(x, "page_content", None)
+            if pc is not None:
+                return {"page_content": pc, "metadata": getattr(x, "metadata", None)}
+        except Exception:
+            pass
+        if isinstance(x, str | int | float | bool | dict | list):
+            return x
+        return {"_repr": repr(x)}
+
+    def _extract_top_k(self: Any, kwargs: dict[str, Any]) -> int | None:
+        try:
+            if isinstance(kwargs.get("top_k"), int):
+                return int(kwargs["top_k"])
+        except Exception:
+            pass
+        try:
+            k = getattr(self, "k", None) or getattr(self, "top_k", None)
+            if isinstance(k, int):
+                return k
+        except Exception:
+            pass
+        try:
+            sk = getattr(self, "search_kwargs", None)
+            if isinstance(sk, dict) and isinstance(sk.get("k"), int):
+                return int(sk["k"])
+        except Exception:
+            pass
+        return None
+
+    if BaseRetriever is not None and hasattr(BaseRetriever, "get_relevant_documents"):
+        orig_get = BaseRetriever.get_relevant_documents
+
+        def _patched_get(self: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+            res = orig_get(self, query, *args, **kwargs)
+            try:
+                items = [_normalize_doc(xi) for xi in (list(res) if isinstance(res, list) else [])]
+                stage_memory_tap(
+                    {
+                        "kind": "RETRIEVAL",
+                        "mem_provider": f"LangChainRetriever:{type(self).__name__}",
+                        "query": query,
+                        "items": items,
+                        "policy": {
+                            "retriever": "vector",
+                            "top_k": _extract_top_k(self, kwargs),
+                        },
+                    }
+                )
+            except Exception:
+                pass
+            return res
+
+        BaseRetriever.get_relevant_documents = _patched_get
+
+        def _undo_lc_ret_get() -> None:
+            try:
+                BaseRetriever.get_relevant_documents = orig_get
+            except Exception:
+                pass
+
+        teardowns.append(_undo_lc_ret_get)
+
+    # Some retrievers use .invoke as Runnable interface; patch to let .get_relevant_documents stage.
+    if BaseRetriever is not None and hasattr(BaseRetriever, "invoke"):
+        orig_invoke = BaseRetriever.invoke
+
+        def _patched_invoke(self: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+            # Call original; staging handled by get_relevant_documents internally.
+            return orig_invoke(self, query, *args, **kwargs)
+
+        BaseRetriever.invoke = _patched_invoke
+
+        def _undo_lc_ret_invoke() -> None:
+            try:
+                BaseRetriever.invoke = orig_invoke
+            except Exception:
+                pass
+
+        teardowns.append(_undo_lc_ret_invoke)
 
     # --- LlamaIndex (optional) ---
     try:  # pragma: no cover - optional dependency
