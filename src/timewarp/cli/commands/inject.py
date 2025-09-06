@@ -14,13 +14,61 @@ from ...store import LocalStore
 from ..helpers.jsonio import loads_file
 
 
+def _build_prompt_adapter(item: object) -> object:
+    def _identity(x: Any) -> Any:
+        return x
+
+    if isinstance(item, str):
+        text = item
+
+        def _adapter(x: Any) -> Any:
+            if isinstance(x, list):
+                return [{"role": "system", "content": text}, *list(x)]
+            if isinstance(x, str):
+                return str(x) + "\n\n" + text
+            return x
+
+        return _adapter
+    if isinstance(item, dict):
+        mode = str(item.get("mode", "prepend_system")).lower()
+        text = str(item.get("text", ""))
+
+        def _adapter(x: Any) -> Any:
+            if isinstance(x, list):
+                msgs = list(x)
+                if mode == "append_system":
+                    msgs = [*msgs, {"role": "system", "content": text}]
+                elif mode == "replace_system":
+                    replaced = False
+                    out = []
+                    for m in msgs:
+                        if not replaced and isinstance(m, dict) and m.get("role") == "system":
+                            out.append({"role": "system", "content": text})
+                            replaced = True
+                        else:
+                            out.append(m)
+                    msgs = out if replaced else ([{"role": "system", "content": text}, *out])
+                else:
+                    msgs = [{"role": "system", "content": text}, *msgs]
+                return msgs
+            if isinstance(x, str):
+                if mode in {"append_prompt", "append_system"}:
+                    return str(x) + "\n\n" + text
+                elif mode == "replace_prompt":
+                    return text
+                else:
+                    return text + "\n\n" + str(x)
+            return x
+
+        return _adapter
+    return _identity
+
+
 def _handler(args: argparse.Namespace, store: LocalStore) -> int:
     # Validate mutually exclusive modes
-    if not args.output_file and not args.state_patch_file:
-        print("Provide either --output <file> or --state-patch <file>")
-        return 1
-    if args.output_file and args.state_patch_file:
-        print("Use only one of --output or --state-patch")
+    modes = [bool(args.output_file), bool(args.state_patch_file), bool(args.prompt_overrides)]
+    if sum(1 for m in modes if m) != 1:
+        print("Provide exactly one of --output, --state-patch, or --prompt-overrides")
         return 1
 
     replacement: object | None = None
@@ -36,6 +84,19 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
             patch_obj = loads_file(Path(args.state_patch_file))
         except Exception as exc:
             print("Failed to read state patch:", exc)
+            return 1
+
+    prompt_overrides: dict[str, Any] | None = None
+    if args.prompt_overrides:
+        try:
+            obj = loads_file(Path(args.prompt_overrides))
+            if isinstance(obj, dict):
+                prompt_overrides = {str(k): _build_prompt_adapter(v) for k, v in obj.items()}
+            else:
+                print("Invalid prompt overrides file: expected object mapping agent -> spec")
+                return 1
+        except Exception as exc:
+            print("Failed to read prompt overrides:", exc)
             return 1
 
     try:
@@ -55,10 +116,17 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
         try:
             try:
                 llm.strict_meta = bool(args.strict_meta)
+                llm.allow_diff = bool(getattr(args, "allow_diff", False))
                 tool.strict_meta = bool(args.strict_meta)
             except Exception:
                 pass
-            td = _installers.bind_langgraph_playback(graph, llm, tool, memory)
+            td = _installers.bind_langgraph_playback(
+                graph,
+                llm,
+                tool,
+                memory,
+                prompt_overrides=(None if prompt_overrides is None else dict(prompt_overrides)),
+            )
             teardowns.append(td)
         except Exception as exc:  # pragma: no cover
             print("Warning: failed to bind playback wrappers:", exc)
@@ -105,16 +173,26 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
             print("Failed to apply state patch:", exc)
             return 1
 
-    # Output override mode
+    # Output override mode or prompt overrides fork
     replayer = LangGraphReplayer(graph=graph, store=store)
-    new_id = replayer.fork_with_injection(
-        UUID(args.run_id),
-        args.step,
-        replacement,
-        args.thread_id,
-        install_wrappers=installer_inject,
-        freeze_time=bool(getattr(args, "freeze_time", False)),
-    )
+    if prompt_overrides is not None:
+        new_id = replayer.fork_with_prompt_overrides(
+            UUID(args.run_id),
+            cast(dict[str, Callable[[Any], Any]], prompt_overrides),
+            args.thread_id,
+            install_wrappers=installer_inject,
+            freeze_time=bool(getattr(args, "freeze_time", False)),
+            allow_diff=bool(getattr(args, "allow_diff", False)),
+        )
+    else:
+        new_id = replayer.fork_with_injection(
+            UUID(args.run_id),
+            args.step,
+            replacement,
+            args.thread_id,
+            install_wrappers=installer_inject,
+            freeze_time=bool(getattr(args, "freeze_time", False)),
+        )
     # If recording now, execute the graph with a recorder bound to the new run id
     if bool(getattr(args, "record_fork", False)):
         try:
@@ -139,12 +217,17 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
                     proj = r.project
                     name = r.name
                     break
+            new_labels = {"branch_of": str(args.run_id)}
+            if prompt_overrides is not None:
+                new_labels["override_step"] = "prompt_overrides"
+            else:
+                new_labels["override_step"] = str(args.step)
             new_run = _Run(
                 run_id=new_id,
                 project=proj,
                 name=name,
                 framework="langgraph",
-                labels={"branch_of": str(args.run_id), "override_step": str(args.step)},
+                labels=new_labels,
             )
             from ...adapters.langgraph import LangGraphRecorder as _LGRecorder
 
@@ -170,7 +253,10 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
                 except Exception:
                     pass
     else:
-        print("Fork prepared with override at step", args.step)
+        if prompt_overrides is not None:
+            print("Fork prepared with prompt overrides")
+        else:
+            print("Fork prepared with override at step", args.step)
         print("New run id:", new_id)
         print(
             "Note: to record the fork immediately, re-run with --record-fork or "
@@ -182,12 +268,20 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
 def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     inj = sub.add_parser("inject")
     inj.add_argument("run_id", help="Run ID")
-    inj.add_argument("step", type=int, help="Step to override (ignored with --state-patch)")
+    inj.add_argument(
+        "step", type=int, help="Step to override (ignored with --state-patch/--prompt-overrides)"
+    )
     inj.add_argument("--output", dest="output_file", help="JSON file with replacement output")
     inj.add_argument(
         "--state-patch",
         dest="state_patch_file",
         help="JSON file with state patch to apply at latest checkpoint",
+    )
+    inj.add_argument(
+        "--prompt-overrides",
+        dest="prompt_overrides",
+        default=None,
+        help="Path to JSON mapping agent->override spec",
     )
     inj.add_argument("--thread", dest="thread_id", default=None, help="Thread ID for LangGraph")
     inj.add_argument(
@@ -201,6 +295,12 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
         dest="strict_meta",
         action="store_true",
         help="Enforce model_meta validation in replay (provider/model/params)",
+    )
+    inj.add_argument(
+        "--allow-diff",
+        dest="allow_diff",
+        action="store_true",
+        help="Allow prompt hash mismatches when using prompt overrides",
     )
     inj.add_argument(
         "--record-fork",
