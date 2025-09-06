@@ -60,10 +60,18 @@ class MemoryEmitter:
         namespace_label: str | None,
         thread_id: str | None,
         values: dict[str, Any],
-        memory_keys: list[str] | tuple[str, ...],
+        memory_paths: tuple[str, ...] = (
+            "messages",
+            "history",
+            "scratch",
+            "artifacts",
+            "memory",
+        ),
+        mem_space_resolver: Callable[[dict[str, str], str], str] | None = None,
     ) -> tuple[int, list[Event]]:
         events: list[Event] = []
-        for path in memory_keys:
+        paths: tuple[str, ...] = tuple(memory_paths)
+        for path in paths:
             v = get_by_path(values, path)
             if v is None:
                 continue
@@ -72,10 +80,7 @@ class MemoryEmitter:
             data_b = normalize_bytes(payload, privacy_marks=self.privacy_marks)
             blob = self.store.put_blob(self.run_id, step, BlobKind.MEMORY, data_b)
             h = blob.sha256_hex
-            prev = self.mem_prev.get(path)
-            if prev is not None and prev == h:
-                continue
-            self.mem_prev[path] = h
+            # Prepare labels context early to compute mem_space
             labels: dict[str, str] = {}
             if namespace_label:
                 labels["namespace"] = namespace_label
@@ -83,9 +88,23 @@ class MemoryEmitter:
                 labels["thread_id"] = thread_id
             if actor and actor != "graph":
                 labels["node"] = actor
-            labels["mem_op"] = "PUT" if prev is None else "UPDATE"
+            labels["mem_op"] = "PUT"
             labels["mem_scope"] = infer_mem_scope_from_path(path)
-            labels["mem_space"] = actor or "graph"
+            # Choose mem_space with resolver, defaulting to node/actor/graph
+            mem_space = (
+                mem_space_resolver(labels, actor)
+                if mem_space_resolver is not None
+                else (labels.get("node") or actor or "graph")
+            )
+            labels["mem_space"] = mem_space
+
+            # Track prior hash per mem_space+path to avoid cross-agent suppression
+            prev_key = f"{mem_space}:{path}"
+            prev = self.mem_prev.get(prev_key)
+            if prev is not None and prev == h:
+                continue
+            labels["mem_op"] = "PUT" if prev is None else "UPDATE"
+            self.mem_prev[prev_key] = h
             try:
                 labels["anchor_id"] = make_anchor_id(ActionType.MEMORY, actor, labels)
             except Exception:

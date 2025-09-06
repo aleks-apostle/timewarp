@@ -85,7 +85,8 @@ class LangGraphRecorder:
     state_pruner: Callable[[Any], Any] | None = None
     tool_classifier: ToolClassifier | None = None
     # Memory synthesis controls
-    memory_keys: Sequence[str] = ()  # dot paths within values/state to treat as memory
+    memory_paths: Sequence[str] = ()  # dot paths within values/state to treat as memory
+    mem_space_resolver: Callable[[dict[str, str], str], str] | None = None
     memory_pruner: Callable[[Any], Any] | None = None
     # Retrieval detection (optional)
     detect_retrieval: bool = False
@@ -1013,7 +1014,7 @@ class LangGraphRecorder:
 
             # Memory synthesis from configured value paths
             try:
-                if self.memory_keys:
+                if self.memory_paths:
                     vals_for_mem = self._extract_values(state_like)
                     if isinstance(vals_for_mem, dict):
                         step, mem_events = self._mem_emitter.emit_from_values(
@@ -1022,7 +1023,8 @@ class LangGraphRecorder:
                             namespace_label=namespace_label,
                             thread_id=thread_id,
                             values=vals_for_mem,
-                            memory_keys=tuple(self.memory_keys),
+                            memory_paths=tuple(self.memory_paths),
+                            mem_space_resolver=self.mem_space_resolver,
                         )
                         for _ev3 in mem_events:
                             self._append_event(_ev3)

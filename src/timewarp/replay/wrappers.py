@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -66,10 +67,40 @@ class PlaybackLLM:
     override: dict[int, Any] = field(default_factory=dict)
     strict_meta: bool = False
     freeze_time: bool = False
+    # Optional per-agent prompt overrides. Keyed by labels.node or actor.
+    # The callable receives the original messages/prompt and returns the transformed value.
+    prompt_overrides: dict[str, Callable[[Any], Any]] = field(default_factory=dict)
+    # When True, allow prompt/prompt_ctx mismatches (used by replay forks that intentionally
+    # tweak prompts but keep outputs deterministic). Defaults to False (strict).
+    allow_diff: bool = False
 
     def invoke(self, prompt: Any, **kwargs: Any) -> Any:
         ev = self.cursor.next()
-        # Validate prompt hash if available on the recorded event
+        # Apply per-agent prompt override when configured for this event
+        try:
+            agent_key = ev.labels.get("node") if ev.labels else None
+            if not agent_key:
+                agent_key = ev.actor
+            fn = None
+            if isinstance(agent_key, str) and agent_key:
+                fn = self.prompt_overrides.get(agent_key)
+            if callable(fn):
+                if "messages" in kwargs and kwargs.get("messages") is not None:
+                    try:
+                        kwargs["messages"] = fn(kwargs.get("messages"))
+                    except Exception:
+                        # Best-effort: if override fails, keep original
+                        pass
+                else:
+                    try:
+                        prompt = fn(prompt)
+                    except Exception:
+                        pass
+        except Exception:
+            # Do not let override plumbing break deterministic playback
+            pass
+
+        # Validate prompt hash if available on the recorded event (post-override)
         recorded_prompt_hash: str | None = None
         try:
             recorded_prompt_hash = ev.hashes.get("prompt") if ev.hashes else None
@@ -79,10 +110,22 @@ class PlaybackLLM:
             # Attempt to extract messages-style input
             msgs = kwargs.get("messages")
             got_hash = hash_prompt(messages=msgs, prompt=prompt)
-            if got_hash != recorded_prompt_hash:
+            if got_hash != recorded_prompt_hash and not self.allow_diff:
                 raise LLMPromptMismatch(
                     ev.step, expected_hash=recorded_prompt_hash, got_hash=got_hash
                 )
+            # When we allow diffs, opportunistically stage the new hash for branch recording
+            if got_hash and got_hash != recorded_prompt_hash and self.allow_diff:
+                try:
+                    # Only import locally to avoid hard dependency for non-recording paths
+                    from ..adapters.installers import (
+                        stage_prompt_hash as _stage_prompt_hash,
+                    )
+
+                    _stage_prompt_hash(got_hash)
+                except Exception:
+                    # best-effort
+                    pass
         # Optional tools digest validation (best-effort)
         try:
             recorded_tools_digest: str | None = None
@@ -125,10 +168,21 @@ class PlaybackLLM:
                 )
                 if msgs2 is not None and tools2 is not None:
                     got_ctx = hash_prompt_ctx(messages=msgs2, tools=tools2)
-                    if got_ctx != recorded_ctx:
+                    if got_ctx != recorded_ctx and not self.allow_diff:
                         raise PromptContextMismatch(
                             ev.step, expected_hash=recorded_ctx, got_hash=got_ctx
                         )
+                    if got_ctx and got_ctx != recorded_ctx and self.allow_diff:
+                        try:
+                            from ..adapters.installers import (
+                                stage_prompt_hash as _stage_prompt_hash,
+                            )
+
+                            # For prompt_ctx, also stage a prompt hash derived from messages only
+                            # so that recorders that pop staged hashes can pick it up.
+                            _stage_prompt_hash(hash_prompt(messages=msgs2, prompt=None))
+                        except Exception:
+                            pass
         except PromptContextMismatch:
             raise
         except Exception:

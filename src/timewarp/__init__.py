@@ -19,6 +19,7 @@ from .determinism import SystemTimeProvider, TimeProvider, restore_rng, snapshot
 from .diff import make_anchor_key, realign_by_anchor
 from .events import ActionType, BlobKind, BlobRef, Event, Run
 from .langgraph import RecorderHandle, wrap
+from .memory import rebuild_memory_snapshot
 from .pruners import messages_pruner
 from .replay import (
     AdapterInvariant,
@@ -49,6 +50,7 @@ __all__ = [
     "make_anchor_key",
     "messages_pruner",
     "realign_by_anchor",
+    "rebuild_memory_snapshot",
     "restore_rng",
     "snapshot_rng",
     "to_bytes",

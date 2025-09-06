@@ -202,6 +202,8 @@ class LocalStore:
         self.blobs_root.mkdir(parents=True, exist_ok=True)
         with self._conn() as con:
             con.executescript(_DDL)
+            # Fail-fast if an existing DB is missing required columns (pre-release, no migrations)
+            self._verify_schema(con)
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -435,6 +437,37 @@ class LocalStore:
         if ref.compression == "zstd":
             return zstd_decompress(data)
         return data
+
+    def _verify_schema(self, con: sqlite3.Connection) -> None:
+        """Ensure required columns exist on core tables.
+
+        Pre-release stance: if required columns are missing, raise with a clear
+        message rather than attempting a migration.
+        """
+        try:
+            cur = con.execute("PRAGMA table_info(events)")
+            cols = {str(r[1]) for r in cur.fetchall()}
+        except Exception:
+            # Table will be created by _DDL above; nothing to verify yet
+            return
+        required = {
+            "tools_digest",
+            "mem_op",
+            "mem_scope",
+            "mem_space",
+            "mem_provider",
+            "query_id",
+            "retriever",
+            "top_k",
+        }
+        missing = sorted(list(required - cols))
+        if missing:
+            raise RuntimeError(
+                "Timewarp DB schema is outdated. Missing columns: "
+                + ", ".join(missing)
+                + ". This is a pre-release: please recreate your DB (delete your "
+                "SQLite file and blobs) or re-record runs."
+            )
 
     # --- blob finalization helpers ---
 

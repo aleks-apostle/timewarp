@@ -42,7 +42,7 @@ def test_memory_events_emitted_for_configured_keys(tmp_path: Path) -> None:
         run=run,
         stream_modes=("values",),
         stream_subgraphs=False,
-        memory_keys=("mem.long",),
+        memory_paths=("mem.long",),
         memory_pruner=pruner,
     )
     _ = rec.invoke({"x": 1}, config={"configurable": {"thread_id": "t-1"}})
