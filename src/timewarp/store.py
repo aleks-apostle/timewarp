@@ -13,6 +13,7 @@ from uuid import UUID
 from .codec import zstd_compress, zstd_decompress
 from .events import BlobKind, BlobRef, Event, Run, hash_bytes
 from .telemetry import record_event_span
+from .utils.logging import log_warn_once
 
 # Event table column order used by INSERTs/SELECTs.
 _EVENT_COLS = (
@@ -173,15 +174,6 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_by_actor ON events(run_id, actor);
 CREATE INDEX IF NOT EXISTS events_by_type ON events(run_id, action_type);
 CREATE INDEX IF NOT EXISTS runs_project_started ON runs(project, started_at);
--- JSON label helper indexes (best-effort; require SQLite JSON1)
-CREATE INDEX IF NOT EXISTS idx_events_run_checkpoint ON events(
-  run_id,
-  json_extract(labels, '$.checkpoint_id')
-);
-CREATE INDEX IF NOT EXISTS idx_events_run_anchor ON events(
-  run_id,
-  json_extract(labels, '$.anchor_id')
-);
 """
 
 
@@ -202,7 +194,11 @@ class LocalStore:
         self.blobs_root.mkdir(parents=True, exist_ok=True)
         with self._conn() as con:
             con.executescript(_DDL)
-            # Fail-fast if an existing DB is missing required columns (pre-release, no migrations)
+            # Apply non-destructive migrations before verifying schema
+            self._migrate_if_needed(con)
+            # Best-effort: create JSON1-based indexes when available
+            self._create_json_indexes_if_available(con)
+            # Finally, verify schema has required columns after migrations
             self._verify_schema(con)
 
     @contextmanager
@@ -213,13 +209,27 @@ class LocalStore:
             con.execute("PRAGMA journal_mode=WAL;")
             con.execute("PRAGMA synchronous=NORMAL;")
         except Exception:
-            pass
+            log_warn_once("sqlite.pragmas.journal_sync", None)
         # Apply busy timeout if configured (helps under concurrent writers)
         try:
             if isinstance(self.busy_timeout_ms, int) and self.busy_timeout_ms > 0:
                 con.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_ms)};")
         except Exception:
-            pass
+            log_warn_once("sqlite.pragmas.busy_timeout", None, {"ms": self.busy_timeout_ms})
+        # Additional recommended PRAGMAs (best-effort)
+        try:
+            con.execute("PRAGMA foreign_keys=ON;")
+        except Exception as e:
+            log_warn_once("sqlite.pragmas.foreign_keys", e)
+        try:
+            con.execute("PRAGMA temp_store=MEMORY;")
+        except Exception as e:
+            log_warn_once("sqlite.pragmas.temp_store", e)
+        try:
+            # Limit WAL/journal growth on long sessions (value in bytes)
+            con.execute("PRAGMA journal_size_limit=67108864;")  # 64 MiB
+        except Exception as e:
+            log_warn_once("sqlite.pragmas.journal_size_limit", e)
         try:
             yield con
             con.commit()
@@ -441,8 +451,7 @@ class LocalStore:
     def _verify_schema(self, con: sqlite3.Connection) -> None:
         """Ensure required columns exist on core tables.
 
-        Pre-release stance: if required columns are missing, raise with a clear
-        message rather than attempting a migration.
+        If required columns are missing after migrations, raise with a clear message.
         """
         try:
             cur = con.execute("PRAGMA table_info(events)")
@@ -465,9 +474,81 @@ class LocalStore:
             raise RuntimeError(
                 "Timewarp DB schema is outdated. Missing columns: "
                 + ", ".join(missing)
-                + ". This is a pre-release: please recreate your DB (delete your "
-                "SQLite file and blobs) or re-record runs."
+                + ". Please re-initialize your DB or upgrade via migrations."
             )
+
+    def _migrate_if_needed(self, con: sqlite3.Connection) -> None:
+        """Apply non-destructive migrations and set PRAGMA user_version.
+
+        Adds missing columns on events and updates user_version to the current schema.
+        """
+        try:
+            # Determine current columns
+            cur = con.execute("PRAGMA table_info(events)")
+            cols = {str(r[1]) for r in cur.fetchall()}
+        except Exception as e:
+            log_warn_once("sqlite.migrate.table_info", e)
+            cols = set()
+
+        # Planned columns and their SQL types
+        needed: dict[str, str] = {
+            "tools_digest": "TEXT",
+            "mem_op": "TEXT",
+            "mem_scope": "TEXT",
+            "mem_space": "TEXT",
+            "mem_provider": "TEXT",
+            "query_id": "TEXT",
+            "retriever": "TEXT",
+            "top_k": "INTEGER",
+        }
+        for col, typ in needed.items():
+            if col not in cols:
+                try:
+                    con.execute(f"ALTER TABLE events ADD COLUMN {col} {typ}")
+                except Exception as e:
+                    # If the column already exists or ALTER fails, warn once and continue
+                    log_warn_once("sqlite.migrate.add_column." + col, e)
+
+        # Set/upgrade user_version (best-effort)
+        try:
+            target = 3
+            ver_row = con.execute("PRAGMA user_version").fetchone()
+            current = int(ver_row[0]) if ver_row and ver_row[0] is not None else 0
+            if current < target:
+                con.execute(f"PRAGMA user_version={target}")
+        except Exception as e:
+            log_warn_once("sqlite.migrate.user_version", e)
+
+    def _create_json_indexes_if_available(self, con: sqlite3.Connection) -> None:
+        """Create JSON1-dependent indexes when the JSON1 extension is available.
+
+        Best-effort: if JSON1 is not available, skip and warn once.
+        """
+        try:
+            # Probe json_extract
+            con.execute("SELECT json_extract('[]', '$[0]')")
+        except Exception as e:
+            log_warn_once("sqlite.json1.unavailable", e)
+            return
+        try:
+            con.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_events_run_checkpoint ON events(
+                  run_id,
+                  json_extract(labels, '$.checkpoint_id')
+                );
+                """
+            )
+            con.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_events_run_anchor ON events(
+                  run_id,
+                  json_extract(labels, '$.anchor_id')
+                );
+                """
+            )
+        except Exception as e:
+            log_warn_once("sqlite.json1.index_create", e)
 
     # --- blob finalization helpers ---
 
