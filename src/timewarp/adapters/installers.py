@@ -22,6 +22,7 @@ from uuid import UUID
 from ..codec import to_bytes
 from ..events import hash_bytes
 from ..replay import PlaybackLLM, PlaybackMemory, PlaybackTool
+from ..utils.logging import log_warn_once
 
 # --- Staging queues for record-time taps ---
 # New: session-scoped staging via ContextVar to avoid cross-run leakage.
@@ -52,9 +53,9 @@ def begin_recording_session(run_id: UUID) -> Callable[[], None]:
     def _end() -> None:
         try:
             _SESSION.reset(token)
-        except Exception:
-            # best-effort
-            pass
+        except Exception as e:
+            # best-effort; log once to aid debugging of session scope reset
+            log_warn_once("installers.session.reset_failed", e)
 
     return _end
 
@@ -126,8 +127,8 @@ def bind_langgraph_playback(
     try:
         if isinstance(prompt_overrides, dict) and prompt_overrides:
             llm.prompt_overrides = dict(prompt_overrides)
-    except Exception:
-        pass
+    except Exception as e:
+        log_warn_once("installers.playback.prompt_overrides_failed", e)
 
     # Patch LangChain Chat/Language models (import lazily to avoid mypy issues)
     import importlib
@@ -168,8 +169,8 @@ def bind_langgraph_playback(
         def _undo() -> None:
             try:
                 cls.invoke = orig_invoke
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("installers.bind_playback.undo_invoke_failed", e)
 
         return _undo
 
@@ -197,8 +198,8 @@ def bind_langgraph_playback(
         def _undo_tool() -> None:
             try:
                 BaseToolCls.__call__ = orig_call
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("installers.bind_playback.undo_tool_failed", e)
 
         teardowns.append(_undo_tool)
 
@@ -246,8 +247,8 @@ def bind_langgraph_playback(
                     undo = _patch_mem0_method(m)
                     if undo is not None:
                         teardowns.append(undo)
-        except Exception:
-            pass
+        except Exception as e:
+            log_warn_once("installers.mem0.patch_failed", e)
 
         # LlamaIndex retriever patch (best-effort)
         try:  # pragma: no cover - optional dependency
@@ -266,20 +267,20 @@ def bind_langgraph_playback(
                 def _undo_li() -> None:
                     try:
                         RetrieverBase.retrieve = orig_ret
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log_warn_once("installers.llamaindex.undo_failed", e)
 
                 teardowns.append(_undo_li)
-        except Exception:
-            pass
+        except Exception as e:
+            log_warn_once("installers.llamaindex.patch_failed", e)
 
     # Compose teardowns
     def teardown() -> None:
         for f in reversed(teardowns):
             try:
                 f()
-            except Exception:
-                continue
+            except Exception as e:
+                log_warn_once("installers.bind_playback.teardown_failed", e)
 
     return teardown
 
@@ -331,8 +332,8 @@ def bind_langgraph_record() -> Callable[[], None]:
         def _undo() -> None:
             try:
                 cls.invoke = orig
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("installers.bind_record.undo_invoke_failed", e)
 
         return _undo
 
@@ -355,8 +356,9 @@ def bind_langgraph_record() -> Callable[[], None]:
         def _patched_call(self: Any, *args: Any, **kwargs: Any) -> Any:
             try:
                 stage_tool_args_hash(hash_bytes(to_bytes({"args": list(args), "kwargs": kwargs})))
-            except Exception:
-                pass
+            except Exception as e:
+                # best-effort; warn once for serialization failures
+                log_warn_once("installers.bind_record.stage_tool_args_failed", e)
             return orig_call(self, *args, **kwargs)
 
         BaseToolCls.__call__ = _patched_call
@@ -364,8 +366,8 @@ def bind_langgraph_record() -> Callable[[], None]:
         def _undo_tool() -> None:
             try:
                 BaseToolCls.__call__ = orig_call
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("installers.bind_record.undo_tool_failed", e)
 
         teardowns.append(_undo_tool)
 
@@ -373,8 +375,8 @@ def bind_langgraph_record() -> Callable[[], None]:
         for f in reversed(teardowns):
             try:
                 f()
-            except Exception:
-                continue
+            except Exception as e:
+                log_warn_once("installers.bind_record.teardown_failed", e)
 
     return teardown
 
@@ -448,8 +450,8 @@ def try_pop_memory_taps(max_items: int = 1000) -> list[dict[str, Any]]:
         while sess.memtaps and n < max_items:
             out.append(sess.memtaps.popleft())
             n += 1
-    except Exception:
-        pass
+    except Exception as e:
+        log_warn_once("installers.mem0.bind_failed", e)
     return out
 
 
@@ -625,8 +627,8 @@ def bind_memory_taps() -> Callable[[], None]:
         def _undo_lc_ret_get() -> None:
             try:
                 BaseRetriever.get_relevant_documents = orig_get
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("installers.langchain_retriever.undo_get_failed", e)
 
         teardowns.append(_undo_lc_ret_get)
 
@@ -643,8 +645,8 @@ def bind_memory_taps() -> Callable[[], None]:
         def _undo_lc_ret_invoke() -> None:
             try:
                 BaseRetriever.invoke = orig_invoke
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("installers.langchain_retriever.undo_invoke_failed", e)
 
         teardowns.append(_undo_lc_ret_invoke)
 
@@ -696,14 +698,14 @@ def bind_memory_taps() -> Callable[[], None]:
                     pass
 
             teardowns.append(_undo_li)
-    except Exception:
-        pass
+    except Exception as e:
+        log_warn_once("installers.llamaindex.bind_failed", e)
 
     def teardown() -> None:
         for f in reversed(teardowns):
             try:
                 f()
-            except Exception:
-                continue
+            except Exception as e:
+                log_warn_once("installers.memory_taps.teardown_failed", e)
 
     return teardown

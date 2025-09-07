@@ -325,6 +325,23 @@ class LocalStore:
                 # propagate after closing span context to avoid masking tracing
                 raise
             with self._conn() as con:
+                # Monotonic step guard per run
+                try:
+                    cur = con.execute(
+                        "SELECT MAX(step) FROM events WHERE run_id=?", (str(ev_to_store.run_id),)
+                    )
+                    row = cur.fetchone()
+                    max_step = int(row[0]) if row and row[0] is not None else -1
+                    if int(ev_to_store.step) <= max_step:
+                        raise RuntimeError(
+                            f"events out-of-order or duplicate step for run {ev_to_store.run_id}: "
+                            f"db_max={max_step} got={ev_to_store.step}"
+                        )
+                except Exception as e:
+                    if isinstance(e, RuntimeError):
+                        raise
+                    # best-effort; on failure, proceed and let PK constraint enforce
+                    log_warn_once("sqlite.monotonic.guard.single", e)
                 con.execute(
                     (
                         f"INSERT INTO events ({_EVENT_COLS}) VALUES ("
@@ -342,6 +359,36 @@ class LocalStore:
         if not events:
             return
         with self._conn() as con:
+            # Pre-check monotonic order per run_id
+            try:
+                # Group events by run_id preserving input order
+                by_run: dict[str, list[Event]] = {}
+                for ev in events:
+                    by_run.setdefault(str(ev.run_id), []).append(ev)
+                for run_id_s, evs in by_run.items():
+                    # Ensure ascending strictly within batch as given
+                    last = -1
+                    for ev in evs:
+                        s = int(ev.step)
+                        if s <= last:
+                            raise RuntimeError(
+                                f"batch steps not strictly increasing for run {run_id_s}: "
+                                f"prev={last} got={s}"
+                            )
+                        last = s
+                    # Compare first batch step against existing max in DB
+                    cur = con.execute("SELECT MAX(step) FROM events WHERE run_id=?", (run_id_s,))
+                    row = cur.fetchone()
+                    max_step = int(row[0]) if row and row[0] is not None else -1
+                    if int(evs[0].step) <= max_step:
+                        raise RuntimeError(
+                            f"events out-of-order or duplicate step for run {run_id_s}: "
+                            f"db_max={max_step} first_batch_step={int(evs[0].step)}"
+                        )
+            except Exception as e:
+                if isinstance(e, RuntimeError):
+                    raise
+                log_warn_once("sqlite.monotonic.guard.batch", e)
             for ev in events:
                 ev_to_store = ev
                 # Emit span and embed trace/span ids when available
@@ -544,6 +591,15 @@ class LocalStore:
                 CREATE INDEX IF NOT EXISTS idx_events_run_anchor ON events(
                   run_id,
                   json_extract(labels, '$.anchor_id')
+                );
+                """
+            )
+            con.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_events_run_thread_step ON events(
+                  run_id,
+                  json_extract(labels, '$.thread_id'),
+                  step
                 );
                 """
             )

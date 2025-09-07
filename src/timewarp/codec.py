@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 from typing import Any
 
 import orjson
@@ -24,8 +25,18 @@ def from_bytes(data: bytes) -> Any:
     return orjson.loads(data)
 
 
-_ZSTD_LEVEL_DEFAULT = 8
-_STREAMING_THRESHOLD = 8 << 20  # 8 MiB
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.environ.get(name)
+        if v is None:
+            return default
+        return int(v.strip())
+    except Exception:
+        return default
+
+
+_ZSTD_LEVEL_DEFAULT = _env_int("TIMEWARP_ZSTD_LEVEL", 8)
+_STREAMING_THRESHOLD = _env_int("TIMEWARP_ZSTD_STREAMING_THRESHOLD", 8 << 20)  # bytes
 
 
 def zstd_compress(data: bytes, *, level: int = _ZSTD_LEVEL_DEFAULT) -> bytes:

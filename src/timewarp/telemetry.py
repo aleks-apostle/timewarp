@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -61,14 +62,21 @@ def configure(
             sdk_trace = importlib.import_module("opentelemetry.sdk.trace")
             tp = sdk_trace.TracerProvider()
         # Sampling option (basic support)
+        if sampling is None:
+            sampling = os.environ.get("TIMEWARP_OTEL_SAMPLING")
         if sampling:
             try:
                 sdk_trace_sampl = importlib.import_module("opentelemetry.sdk.trace.sampling")
-                if sampling == "always_on":
+                # Normalize common aliases
+                s = sampling.strip().lower()
+                if s in {"on", "always_on", "always-on", "true", "yes", "1"}:
                     sampler = sdk_trace_sampl.ALWAYS_ON
-                elif sampling.startswith("ratio(") and sampling.endswith(")"):
-                    rate = float(sampling[len("ratio(") : -1])
+                elif s.startswith("ratio(") and s.endswith(")"):
+                    rate = float(s[len("ratio(") : -1])
                     sampler = sdk_trace_sampl.TraceIdRatioBased(rate)
+                elif s == "parent":
+                    # Parent-based sampling can be approximated by keeping the provider default
+                    sampler = None
                 else:
                     sampler = None
                 if sampler is not None and tp is not None:

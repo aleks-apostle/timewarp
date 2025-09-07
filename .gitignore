@@ -30,6 +30,7 @@ timewarp.sqlite3
 timewarp.db
 .github
 ds.json
+tmp_run
 planned-next.md
 publish.md
 
