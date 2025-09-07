@@ -10,6 +10,15 @@ from .anchors import make_anchor_id
 from .serialize import normalize_bytes
 
 
+def _get_timewarp_version() -> str:
+    try:
+        from timewarp import __version__ as _tw_version
+
+        return _tw_version
+    except Exception:
+        return "0+unknown"
+
+
 def detect_retrieval(values_like: Any) -> dict[str, Any] | None:
     try:
         src = values_like
@@ -100,7 +109,7 @@ def emit_retrieval_event(
             labels=labels,
             model_meta={
                 "adapter_version": adapter_version,
-                "timewarp_version": adapter_version,
+                "timewarp_version": _get_timewarp_version(),
                 "framework": "langgraph",
                 "mem_provider": "LangGraphState",
             },
