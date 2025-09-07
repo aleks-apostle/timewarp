@@ -6,8 +6,8 @@ from typing import Any
 import orjson as _orjson
 import pytest
 
-from timewarp.adapters.langgraph import LangGraphRecorder
 from timewarp.events import ActionType, BlobKind, Event, Run
+from timewarp.langgraph import LangGraphRecorder
 from timewarp.replay import Replay, SchemaMismatch
 from timewarp.store import LocalStore
 

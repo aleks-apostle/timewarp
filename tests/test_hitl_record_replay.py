@@ -4,9 +4,9 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from timewarp.adapters.langgraph import LangGraphRecorder
 from timewarp.codec import from_bytes
 from timewarp.events import ActionType, Run
+from timewarp.langgraph import LangGraphRecorder
 from timewarp.replay import LangGraphReplayer
 from timewarp.store import LocalStore
 

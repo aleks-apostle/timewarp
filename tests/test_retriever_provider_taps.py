@@ -5,9 +5,9 @@ from typing import Any
 
 import pytest
 
-from timewarp.adapters.installers import begin_recording_session, bind_memory_taps
-from timewarp.adapters.langgraph import LangGraphRecorder
+from timewarp.bindings import begin_recording_session, bind_memory_taps
 from timewarp.events import ActionType, Run
+from timewarp.langgraph import LangGraphRecorder
 from timewarp.store import LocalStore
 
 try:  # optional dependencies

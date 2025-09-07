@@ -28,7 +28,7 @@ def test_cli_memory_summary_show_and_diff(tmp_path: Path, capsys: Any) -> None:
     store = LocalStore(db_path=tmp_path / "db.sqlite", blobs_root=tmp_path / "blobs")
     run = Run(project="p", name="mem-cli", framework="langgraph")
 
-    from timewarp.adapters.langgraph import LangGraphRecorder
+    from timewarp.langgraph import LangGraphRecorder
 
     rec = LangGraphRecorder(
         graph=graph,

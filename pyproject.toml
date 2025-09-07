@@ -53,12 +53,6 @@ dev = [
 ]
 
 [project.optional-dependencies]
-adapters = [
-    # Kept optional to avoid forcing heavy installs in core.
-    "langgraph>=0.6; python_version>='3.10'",
-    # LangChain core is used in tests for messages-mode streaming validation
-    "langchain-core>=0.3; python_version>='3.10'",
-]
 otel = [
     "opentelemetry-api>=1.25",
     "opentelemetry-sdk>=1.25",

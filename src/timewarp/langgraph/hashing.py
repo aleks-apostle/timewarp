@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...utils.hashing import hash_prompt_ctx as _hash_prompt_ctx
-from ...utils.hashing import hash_tools_list as _hash_tools_list
+from ..utils.hashing import hash_prompt_ctx as _hash_prompt_ctx
+from ..utils.hashing import hash_tools_list as _hash_tools_list
 
 
 def hash_tools_list(tools: list[Any]) -> str:

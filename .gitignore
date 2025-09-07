@@ -28,11 +28,13 @@ SPRINTS/
 .docs/
 timewarp.sqlite3
 timewarp.db
+.sqlite3
 .github
 ds.json
 tmp_run
 planned-next.md
 publish.md
+.venv_pack
 
 # Python bytecode and caches
 **/__pycache__/

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
-from ...adapters import installers as _installers
+from ...bindings import bind_langgraph_playback
 from ...replay import LangGraphReplayer
 from ...store import LocalStore
 from ..helpers.jsonio import dumps_text, loads_file
@@ -75,6 +75,14 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
         print("Failed to import app factory:", exc)
         return 1
 
+    def _assert_langgraph(obj: object) -> None:
+        if not (hasattr(obj, "stream") or hasattr(obj, "invoke")):
+            raise SystemExit(
+                "This CLI only supports LangGraph compiled graphs (need .stream/.invoke)"
+            )
+
+    _assert_langgraph(graph)
+
     from ...replay import PlaybackLLM, PlaybackMemory, PlaybackTool  # typing-only import
 
     # Narrow type to Callable mapping for installers signature
@@ -96,11 +104,11 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
                 tool.strict_meta = bool(args.strict_meta)
             except Exception:
                 pass
-            _installers.bind_langgraph_playback(
-                graph,
-                llm,
-                tool,
-                memory,
+            bind_langgraph_playback(
+                graph=graph,
+                llm=llm,
+                tool=tool,
+                memory=memory,
                 prompt_overrides=(None if prompt_overrides is None else dict(prompt_overrides)),
             )
         except Exception as exc:  # pragma: no cover

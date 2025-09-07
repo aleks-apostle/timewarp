@@ -28,7 +28,7 @@ def test_cli_resume_and_inject_record_fork_end_to_end(tmp_path: Path, capsys) ->
     graph = make_graph()
     run = Run(project="p", name="e2e", framework="langgraph")
 
-    from timewarp.adapters.langgraph import LangGraphRecorder
+    from timewarp.langgraph import LangGraphRecorder
 
     rec = LangGraphRecorder(
         graph=graph,

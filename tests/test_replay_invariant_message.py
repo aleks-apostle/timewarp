@@ -5,8 +5,8 @@ from typing import Any, TypedDict
 
 import pytest
 
-from timewarp.adapters.langgraph import LangGraphRecorder
 from timewarp.events import Run
+from timewarp.langgraph import LangGraphRecorder
 from timewarp.replay import AdapterInvariant, LangGraphReplayer
 from timewarp.store import LocalStore
 
@@ -54,6 +54,6 @@ def test_replay_requires_wrappers_message(tmp_path: Path) -> None:
         _ = replayer.resume(run.run_id, from_step=None, thread_id=None, install_wrappers=None)
     msg = str(ei.value)
     assert "Playback wrappers required" in msg
-    assert "uv pip install -e .[adapters]" in msg
     assert "bind_langgraph_playback" in msg
+    assert "langchain-core" in msg or "optional deps" in msg
     assert "CLI `resume`" in msg

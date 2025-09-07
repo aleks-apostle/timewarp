@@ -7,7 +7,7 @@ from uuid import UUID
 import orjson as _orjson
 
 from examples.langgraph_demo.app import make_graph
-from timewarp.adapters.installers import bind_langgraph_playback
+from timewarp.bindings import bind_langgraph_playback
 from timewarp.replay import LangGraphReplayer
 from timewarp.store import LocalStore
 

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from timewarp.adapters.langgraph.recorder import EventBatcher
 from timewarp.events import ActionType, Event
+from timewarp.langgraph.recorder import EventBatcher
 
 
 class _CaptureStore:

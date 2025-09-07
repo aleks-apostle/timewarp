@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
-from ...determinism import now as tw_now
-from ...events import ActionType, BlobKind, Event
-from ...store import LocalStore
+from ..determinism import now as tw_now
+from ..events import ActionType, BlobKind, Event
+from ..store import LocalStore
 from .anchors import make_anchor_id
 from .serialize import normalize_bytes
 

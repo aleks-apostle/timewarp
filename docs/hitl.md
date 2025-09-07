@@ -13,7 +13,7 @@ Recommended recorder settings
 
 Python (recorder)
 ```python
-from timewarp.adapters.langgraph import LangGraphRecorder
+from timewarp.langgraph import LangGraphRecorder
 from timewarp.events import Run
 from timewarp.store import LocalStore
 from timewarp.pruners import messages_pruner
@@ -53,4 +53,3 @@ Notes
 - If your HITL pattern emits explicit tool calls or messages with human content, they will be logged as TOOL/LLM events and preserved on replay.
 - DECISION events include an `anchor_id` for diffing/alignment across runs with different routing.
 - For sensitive human inputs, combine with `privacy_marks` (see privacy.md).
-

@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from examples.langgraph_demo.app import make_graph
-from timewarp.adapters.langgraph import LangGraphRecorder
 from timewarp.events import Run
+from timewarp.langgraph import LangGraphRecorder
 from timewarp.store import LocalStore
 
 

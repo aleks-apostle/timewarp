@@ -4,10 +4,10 @@ from dataclasses import dataclass, field
 from typing import Any, TypedDict
 from uuid import UUID
 
-from ...determinism import now as tw_now
-from ...events import ActionType, BlobKind, Event, hash_bytes
-from ...store import LocalStore
-from ..installers import try_pop_prompt_hash
+from ..bindings import try_pop_prompt_hash
+from ..determinism import now as tw_now
+from ..events import ActionType, BlobKind, Event, hash_bytes
+from ..store import LocalStore
 from .anchors import make_anchor_id
 from .hashing import hash_prompt_ctx, hash_tools_list
 from .serialize import normalize_bytes
@@ -50,7 +50,7 @@ def finalize_messages_aggregate(
     ctx_messages: Any | None = None
     _prompt_hash_failed = False
     try:
-        from ...codec import to_bytes as _to_bytes
+        from ..codec import to_bytes as _to_bytes
 
         sources: list[Any] = []
         for ch in agg_chunks:
@@ -129,6 +129,7 @@ def finalize_messages_aggregate(
         labels=labels2,
         model_meta={
             "adapter_version": adapter_version,
+            "timewarp_version": adapter_version,
             "framework": "langgraph",
             "chunks_count": len(agg_chunks),
             "prompt_hash_agg_failed": True if _prompt_hash_failed else False,

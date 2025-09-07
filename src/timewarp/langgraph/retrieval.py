@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from ...determinism import now as tw_now
-from ...events import ActionType, BlobKind, Event, hash_bytes
-from ...store import LocalStore
+from ..determinism import now as tw_now
+from ..events import ActionType, BlobKind, Event, hash_bytes
+from ..store import LocalStore
 from .anchors import make_anchor_id
 from .serialize import normalize_bytes
 
@@ -67,7 +67,7 @@ def emit_retrieval_event(
         data_b = normalize_bytes(payload, privacy_marks=privacy_marks)
         blob = store.put_blob(run_id, step, BlobKind.MEMORY, data_b)
 
-        from ...codec import to_bytes as _to_bytes
+        from ..codec import to_bytes as _to_bytes
 
         hashes: dict[str, str] = {}
         try:
@@ -100,6 +100,7 @@ def emit_retrieval_event(
             labels=labels,
             model_meta={
                 "adapter_version": adapter_version,
+                "timewarp_version": adapter_version,
                 "framework": "langgraph",
                 "mem_provider": "LangGraphState",
             },

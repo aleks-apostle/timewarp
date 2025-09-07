@@ -18,7 +18,7 @@ from typing import Any
 from uuid import UUID
 
 from timewarp import messages_pruner, wrap
-from timewarp.adapters.installers import bind_langgraph_playback
+from timewarp.bindings import bind_langgraph_playback
 from timewarp.diff import bisect_divergence, first_divergence
 from timewarp.replay import LangGraphReplayer, Replay
 from timewarp.store import LocalStore
@@ -75,8 +75,8 @@ def main() -> int:
     replayer = LangGraphReplayer(graph=graph, store=store)
     teardowns: list[Any] = []
 
-    def _installer(llm: Any, tool: Any) -> None:
-        td = bind_langgraph_playback(graph, llm, tool)
+    def _installer(llm: Any, tool: Any, memory: Any) -> None:
+        td = bind_langgraph_playback(graph, llm, tool, memory)
         teardowns.append(td)
 
     alt_output = {"message": {"content": "[what-if override]"}}
@@ -98,8 +98,8 @@ def main() -> int:
             orig_input = _from_bytes(store.get_blob(e.input_ref))
             break
     if orig_input is not None:
-        from timewarp.adapters.langgraph import LangGraphRecorder
         from timewarp.events import Run
+        from timewarp.langgraph import LangGraphRecorder
 
         new_run = Run(
             run_id=new_id,

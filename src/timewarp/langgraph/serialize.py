@@ -10,8 +10,8 @@ def normalize_bytes(
     privacy_marks: dict[str, str] | None = None,
     extract_values_fn: Callable[[Any], Any | None] | None = None,
 ) -> bytes:
-    from ...codec import to_bytes
-    from ...events import redact
+    from ..codec import to_bytes
+    from ..events import redact
 
     redacted = obj
     try:

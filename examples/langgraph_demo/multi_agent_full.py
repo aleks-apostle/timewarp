@@ -302,8 +302,8 @@ def _inject_what_if(run_id: Any) -> Any:
     from pathlib import Path
     from uuid import UUID
 
-    from timewarp.adapters.langgraph import LangGraphRecorder
     from timewarp.events import Run
+    from timewarp.langgraph import LangGraphRecorder
     from timewarp.replay import LangGraphReplayer
     from timewarp.store import LocalStore
 
@@ -323,7 +323,7 @@ def _inject_what_if(run_id: Any) -> Any:
     teardowns: list[Callable[[], None]] = []
 
     def installer(llm: Any, tool: Any) -> None:
-        from timewarp.adapters.installers import bind_langgraph_playback
+        from timewarp.bindings import bind_langgraph_playback
 
         td = bind_langgraph_playback(graph, llm, tool)
         teardowns.append(td)

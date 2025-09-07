@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from timewarp.adapters.installers import bind_langgraph_playback
+from timewarp.bindings import bind_langgraph_playback
 from timewarp.events import ActionType, BlobKind, Event, Run
 from timewarp.replay import LLMPromptMismatch, PlaybackLLM, PlaybackTool, _EventCursor
 from timewarp.store import LocalStore

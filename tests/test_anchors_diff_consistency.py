@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from timewarp.adapters.langgraph.anchors import make_anchor_id
 from timewarp.diff import make_anchor_key
 from timewarp.events import ActionType, Event
+from timewarp.langgraph.anchors import make_anchor_id
 
 
 def test_adapter_anchor_matches_diff_anchor_key() -> None:

@@ -219,7 +219,7 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
         # Load overrides spec (JSON)
         from importlib import import_module
 
-        from ...adapters import installers as _installers
+        from ...bindings import bind_langgraph_playback
         from ...events import Run as _Run
         from ...replay import LangGraphReplayer
 
@@ -318,8 +318,12 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
                     llm.prompt_overrides = dict(prompt_overrides)
                 except Exception:
                     pass
-                td = _installers.bind_langgraph_playback(
-                    graph, llm, tool, memory, prompt_overrides=prompt_overrides
+                td = bind_langgraph_playback(
+                    graph=graph,
+                    llm=llm,
+                    tool=tool,
+                    memory=memory,
+                    prompt_overrides=prompt_overrides,
                 )
                 teardowns.append(td)
             except Exception as exc:  # pragma: no cover
@@ -366,8 +370,8 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
                     labels={"branch_of": str(args.run_id), "override_step": "prompt_overrides"},
                 )
                 # Begin a recording session to enable staged hashes from overrides
-                from ...adapters.installers import begin_recording_session
-                from ...adapters.langgraph import LangGraphRecorder as _LGRecorder
+                from ...bindings import begin_recording_session
+                from ...langgraph import LangGraphRecorder as _LGRecorder
 
                 end_session = begin_recording_session(new_run.run_id)
                 try:

@@ -28,7 +28,7 @@ def test_cli_tools_summary_and_detail(tmp_path: Path, capsys: Any) -> None:
     graph = make_graph()
     run = Run(project="p", name="cli-tools", framework="langgraph")
 
-    from timewarp.adapters.langgraph import LangGraphRecorder
+    from timewarp.langgraph import LangGraphRecorder
 
     rec = LangGraphRecorder(
         graph=graph,

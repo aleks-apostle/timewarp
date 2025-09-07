@@ -118,7 +118,7 @@ class PlaybackLLM:
             if got_hash and got_hash != recorded_prompt_hash and self.allow_diff:
                 try:
                     # Only import locally to avoid hard dependency for non-recording paths
-                    from ..adapters.installers import (
+                    from ..bindings import (
                         stage_prompt_hash as _stage_prompt_hash,
                     )
 
@@ -174,7 +174,7 @@ class PlaybackLLM:
                         )
                     if got_ctx and got_ctx != recorded_ctx and self.allow_diff:
                         try:
-                            from ..adapters.installers import (
+                            from ..bindings import (
                                 stage_prompt_hash as _stage_prompt_hash,
                             )
 

@@ -4,10 +4,10 @@ from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
-from ...determinism import now as tw_now
-from ...events import ActionType, BlobKind, Event, hash_bytes
-from ...store import LocalStore
-from ..installers import try_pop_memory_taps
+from ..bindings import try_pop_memory_taps
+from ..determinism import now as tw_now
+from ..events import ActionType, BlobKind, Event, hash_bytes
+from ..store import LocalStore
 from .anchors import make_anchor_id
 from .memory import infer_mem_scope_from_path
 from .serialize import normalize_bytes
@@ -100,7 +100,7 @@ def flush_provider_taps(
                 blob = store.put_blob(run_id, step, BlobKind.MEMORY, data_b)
                 hashes: dict[str, str] = {}
                 try:
-                    from ...codec import to_bytes as _to_bytes
+                    from ..codec import to_bytes as _to_bytes
 
                     if query is not None:
                         hashes["query"] = hash_bytes(_to_bytes(query))
