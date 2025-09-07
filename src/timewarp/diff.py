@@ -24,7 +24,7 @@ class Divergence:
 def make_anchor_key(ev: Event) -> tuple[Any, Any] | tuple[Any, Any, Any, Any, Any | None]:
     """Compute a comparable anchor key for an event.
 
-    Keep aligned with `adapters.langgraph.anchors.make_anchor_id`.
+    Keep aligned with `timewarp.langgraph.anchors.make_anchor_id`.
     Prefers explicit `labels["anchor_id"]` when present; otherwise falls back
     to a tuple of (action_type, actor, namespace, thread_id, prompt_hash?).
     """

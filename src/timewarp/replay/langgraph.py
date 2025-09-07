@@ -81,9 +81,9 @@ class LangGraphReplayer:
             if has_side_effects:
                 raise AdapterInvariant(
                     "Playback wrappers required: detected LLM/TOOL events in run. "
-                    "Install adapters via `uv pip install -e .[adapters]` and bind with "
-                    "`installers.bind_langgraph_playback(graph, llm, tool)`, or use the CLI "
-                    "`resume` command which binds automatically."
+                    "Install optional deps (e.g., langchain-core) and bind with "
+                    "`timewarp.bindings.bind_langgraph_playback(graph, llm, tool, memory)`, "
+                    "or use the CLI `resume` command which binds automatically."
                 )
         else:
             install_wrappers(llm, tool, memory)

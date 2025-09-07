@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from ...events import ActionType
+from ..events import ActionType
 
 
 class ToolClassifier(Protocol):

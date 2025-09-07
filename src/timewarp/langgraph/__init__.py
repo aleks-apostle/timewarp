@@ -6,17 +6,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .adapters.installers import (
+from ..bindings import (
     begin_recording_session,
     bind_langgraph_record,
     bind_memory_taps,
 )
-from .adapters.langgraph import LangGraphRecorder
-from .determinism import now as tw_now
-from .events import Run
-from .store import LocalStore
-from .utils.fingerprint import runtime_labels as _tw_runtime_labels
-from .utils.logging import log_warn_once
+from ..determinism import now as tw_now
+from ..events import Run
+from ..store import LocalStore
+from ..utils.fingerprint import runtime_labels as _tw_runtime_labels
+from ..utils.logging import log_warn_once
+from .classify import ToolClassifier
+from .recorder import LangGraphRecorder
 
 
 @dataclass
@@ -43,6 +44,8 @@ class RecorderHandle:
     require_thread_id: bool
     enable_record_taps: bool
     enable_memory_taps: bool
+    tool_classifier: ToolClassifier | None = None
+    retrieval_detector: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None
     event_batch_size: int = 20
 
     last_run_id: Any | None = None
@@ -65,6 +68,8 @@ class RecorderHandle:
             snapshot_every=self.snapshot_every,
             snapshot_on=self.snapshot_on,
             state_pruner=self.state_pruner,
+            tool_classifier=self.tool_classifier,
+            retrieval_detector=self.retrieval_detector,
             stream_modes=self.stream_modes,
             stream_subgraphs=self.stream_subgraphs,
             require_thread_id=self.require_thread_id,
@@ -117,6 +122,8 @@ class RecorderHandle:
             snapshot_every=self.snapshot_every,
             snapshot_on=self.snapshot_on,
             state_pruner=self.state_pruner,
+            tool_classifier=self.tool_classifier,
+            retrieval_detector=self.retrieval_detector,
             stream_modes=self.stream_modes,
             stream_subgraphs=self.stream_subgraphs,
             require_thread_id=self.require_thread_id,
@@ -164,15 +171,18 @@ def wrap(
     labels: dict[str, str] | None = None,
     privacy_marks: dict[str, str] | None = None,
     durability: str | None = None,
-    stream_modes: Sequence[str] = ("updates", "messages", "values"),
+    stream_modes: Sequence[str] = ("updates", "values"),
     snapshot_every: int = 20,
     snapshot_on: Sequence[str] = ("terminal",),
     state_pruner: Callable[[Any], Any] | None = None,
+    tool_classifier: ToolClassifier | None = None,
+    retrieval_detector: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     stream_subgraphs: bool = True,
     require_thread_id: bool = False,
     enable_record_taps: bool = True,
     enable_memory_taps: bool = True,
     event_batch_size: int = 20,
+    busy_timeout_ms: int | None = 5000,
 ) -> RecorderHandle:
     """Wrap a compiled LangGraph with a recorder facade.
 
@@ -183,7 +193,8 @@ def wrap(
     - labels: Optional run labels (e.g., {"branch_of": <run_id>}).
     - privacy_marks: Redaction configuration applied at serialization time.
     - durability: Optional stream durability to pass through (e.g., "sync").
-    - stream_modes: Which LangGraph stream modes to observe (default: updates+messages+values).
+    - stream_modes: Which LangGraph stream modes to observe
+      (default: updates+values; messages opt-in).
     - snapshot_every: Snapshot cadence in number of update events (default: 20).
     - snapshot_on: Emit snapshots on triggers (e.g., {"terminal","decision"});
       default terminal only.
@@ -194,7 +205,11 @@ def wrap(
     """
 
     if store is None:
-        store = LocalStore(db_path=Path("timewarp.sqlite3"), blobs_root=Path("blobs"))
+        store = LocalStore(
+            db_path=Path("timewarp.sqlite3"),
+            blobs_root=Path("blobs"),
+            busy_timeout_ms=busy_timeout_ms,
+        )
     # Allow environment override for record taps: TIMEWARP_RECORD_TAPS=0 disables
     eff_enable_taps = enable_record_taps
     try:
@@ -232,9 +247,18 @@ def wrap(
         snapshot_every=int(snapshot_every),
         snapshot_on=set(snapshot_on),
         state_pruner=state_pruner,
+        tool_classifier=tool_classifier,
+        retrieval_detector=retrieval_detector,
         stream_subgraphs=bool(stream_subgraphs),
         require_thread_id=bool(require_thread_id),
         enable_record_taps=bool(eff_enable_taps),
         enable_memory_taps=bool(enable_memory_taps),
         event_batch_size=int(event_batch_size),
     )
+
+
+__all__ = [
+    "LangGraphRecorder",
+    "RecorderHandle",
+    "wrap",
+]

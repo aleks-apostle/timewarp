@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ...events import ActionType
+from ..events import ActionType
 
 
 def make_anchor_id(

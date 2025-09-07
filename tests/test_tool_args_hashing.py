@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from timewarp.adapters.langgraph import LangGraphRecorder
 from timewarp.codec import to_bytes
 from timewarp.events import ActionType, Run, hash_bytes
+from timewarp.langgraph import LangGraphRecorder
 from timewarp.store import LocalStore
 
 

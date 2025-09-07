@@ -26,7 +26,7 @@ def test_cli_dspy_fork_prompts_record(tmp_path: Path) -> None:
 
     graph = make_graph()
     run = Run(project="p", name="baseline", framework="langgraph")
-    from timewarp.adapters.langgraph import LangGraphRecorder
+    from timewarp.langgraph import LangGraphRecorder
 
     rec = LangGraphRecorder(
         graph=graph,

@@ -7,7 +7,7 @@ import orjson as _orjson
 import pytest
 
 from timewarp import messages_pruner, wrap
-from timewarp.adapters.installers import stage_memory_tap
+from timewarp.bindings import stage_memory_tap
 from timewarp.diff import bisect_divergence, first_divergence
 from timewarp.events import ActionType
 from timewarp.exporters.langsmith import serialize_run
@@ -236,8 +236,8 @@ def test_e2e_multi_agent_full_demo_exercises_features(tmp_path: Path) -> None:
     )
 
     # Fork a what-if by overriding the first LLM step and record the branch
-    from timewarp.adapters.langgraph import LangGraphRecorder
     from timewarp.events import Run as _Run
+    from timewarp.langgraph import LangGraphRecorder
     from timewarp.replay import LangGraphReplayer
 
     llm_step = next(e.step for e in events if e.action_type is ActionType.LLM)
@@ -248,7 +248,7 @@ def test_e2e_multi_agent_full_demo_exercises_features(tmp_path: Path) -> None:
     teardowns: list[Any] = []
 
     def _installer(llm: Any, tool: Any, _memory: Any) -> None:
-        from timewarp.adapters.installers import bind_langgraph_playback
+        from timewarp.bindings import bind_langgraph_playback
 
         td = bind_langgraph_playback(graph2, llm, tool, _memory)
         teardowns.append(td)

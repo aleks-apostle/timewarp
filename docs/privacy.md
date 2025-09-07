@@ -31,7 +31,7 @@ _ = rec.invoke({"user": {"ssn": "000-11-1234"}}, config={"configurable": {"threa
 
 Python (direct recorder)
 ```python
-from timewarp.adapters.langgraph import LangGraphRecorder
+from timewarp.langgraph import LangGraphRecorder
 rec = LangGraphRecorder(
     graph=compiled,
     store=store,
@@ -51,4 +51,3 @@ Security model
 - Redaction happens before bytes hit disk; hashes are computed on redacted content.
 - Event timestamps and identifiers are never redacted.
 - For multi-tenant/server deployments, pair redaction with store-level RBAC and retention policies.
-

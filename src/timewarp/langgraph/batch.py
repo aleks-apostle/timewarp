@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Lock
 
-from ...events import Event
-from ...store import LocalStore
+from ..events import Event
+from ..store import LocalStore
 
 
 @dataclass

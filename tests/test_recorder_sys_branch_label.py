@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from timewarp.adapters.langgraph import LangGraphRecorder
 from timewarp.events import ActionType, Run
+from timewarp.langgraph import LangGraphRecorder
 from timewarp.store import LocalStore
 
 

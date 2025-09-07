@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
-from ...adapters import installers as _installers
+from ...bindings import bind_langgraph_playback
 from ...events import Run as _Run
 from ...replay import LangGraphReplayer
 from ...store import LocalStore
@@ -109,6 +109,14 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
         print("Failed to import app factory:", exc)
         return 1
 
+    def _assert_langgraph(obj: object) -> None:
+        if not (hasattr(obj, "stream") or hasattr(obj, "invoke")):
+            raise SystemExit(
+                "This CLI only supports LangGraph compiled graphs (need .stream/.invoke)"
+            )
+
+    _assert_langgraph(graph)
+
     from ...replay import PlaybackLLM, PlaybackMemory, PlaybackTool  # typing-only imports
 
     teardowns: list[Callable[[], None]] = []
@@ -121,11 +129,11 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
                 tool.strict_meta = bool(args.strict_meta)
             except Exception:
                 pass
-            td = _installers.bind_langgraph_playback(
-                graph,
-                llm,
-                tool,
-                memory,
+            td = bind_langgraph_playback(
+                graph=graph,
+                llm=llm,
+                tool=tool,
+                memory=memory,
                 prompt_overrides=(None if prompt_overrides is None else dict(prompt_overrides)),
             )
             teardowns.append(td)
@@ -197,6 +205,11 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
     # If recording now, execute the graph with a recorder bound to the new run id
     if bool(getattr(args, "record_fork", False)):
         try:
+            # For now, fork recording is supported for LangGraph only
+            adapter_name = str(getattr(args, "adapter", "auto") or "auto").lower()
+            if adapter_name not in ("auto", "langgraph"):
+                print("--record-fork currently supports only the 'langgraph' adapter")
+                return 1
             # Retrieve original input payload
             evs = store.list_events(UUID(args.run_id))
             orig_input = None
@@ -230,7 +243,7 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
                 framework="langgraph",
                 labels=new_labels,
             )
-            from ...adapters.langgraph import LangGraphRecorder as _LGRecorder
+            from ...langgraph import LangGraphRecorder as _LGRecorder
 
             rec = _LGRecorder(
                 graph=graph,

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from timewarp.adapters.installers import bind_langgraph_playback
+from timewarp.bindings import bind_langgraph_playback
 from timewarp.codec import to_bytes
 from timewarp.events import ActionType, BlobKind, Event, Run, hash_bytes
 from timewarp.replay.exceptions import LLMPromptMismatch

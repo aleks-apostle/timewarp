@@ -300,12 +300,12 @@ class Replay:
         factory = _cast(_Callable[[], _Any], getattr(mod, func_name))
         graph = factory()
 
-        from ..adapters import installers as _installers
+        from ..bindings import bind_langgraph_playback as _bind
 
         def _installer(llm: PlaybackLLM, tool: PlaybackTool, memory: PlaybackMemory) -> None:
             llm.strict_meta = bool(strict_meta)
             tool.strict_meta = bool(strict_meta)
-            _installers.bind_langgraph_playback(graph, llm, tool, memory)
+            _bind(graph=graph, llm=llm, tool=tool, memory=memory)
 
         replayer = LangGraphReplayer(graph=graph, store=store)
         return replayer.resume(

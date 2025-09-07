@@ -13,16 +13,17 @@ from __future__ import annotations
 # using them in short-lived CLI/debug sessions. A teardown callable is returned
 # to restore the original methods.
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
-from ..codec import to_bytes
-from ..events import hash_bytes
-from ..replay import PlaybackLLM, PlaybackMemory, PlaybackTool
-from ..utils.logging import log_warn_once
+from .codec import to_bytes
+from .events import hash_bytes
+from .replay import PlaybackLLM, PlaybackMemory, PlaybackTool
+from .utils.logging import log_warn_once
 
 # --- Staging queues for record-time taps ---
 # New: session-scoped staging via ContextVar to avoid cross-run leakage.
@@ -92,6 +93,27 @@ def try_pop_tool_args_hash() -> str | None:
         return sess.toolargs.popleft()
     except Exception:
         return None
+
+
+@contextmanager
+def record_taps(run_id: UUID) -> Iterator[None]:
+    """Context manager that scopes record-time taps to a run_id.
+
+    Begins a recording session and installs prompt/tool-args hash taps; restores on exit.
+    """
+    end_session = begin_recording_session(run_id)
+    undo = bind_langgraph_record()
+    try:
+        yield None
+    finally:
+        try:
+            undo()
+        except Exception as e:
+            log_warn_once("installers.record_taps.undo_failed", e)
+        try:
+            end_session()
+        except Exception as e:
+            log_warn_once("installers.record_taps.end_session_failed", e)
 
 
 def bind_langgraph_playback(
@@ -257,9 +279,30 @@ def bind_langgraph_playback(
             if RetrieverBase is not None and hasattr(RetrieverBase, "retrieve"):
                 orig_ret = RetrieverBase.retrieve
 
+                def _extract_top_k_li(obj: Any, kwargs: dict[str, Any]) -> int | None:
+                    try:
+                        if isinstance(kwargs.get("top_k"), int):
+                            return int(kwargs["top_k"])
+                    except Exception:
+                        pass
+                    try:
+                        if isinstance(kwargs.get("k"), int):
+                            return int(kwargs["k"])
+                    except Exception:
+                        pass
+                    try:
+                        k = getattr(obj, "k", None) or getattr(obj, "top_k", None)
+                        if isinstance(k, int):
+                            return int(k)
+                    except Exception:
+                        pass
+                    return None
+
                 def _patched_retrieve(self: Any, *args: Any, **kwargs: Any) -> Any:
                     q = args[0] if args else kwargs.get("query")
-                    items = memory.retrieve(q, retriever="llamaindex")
+                    items = memory.retrieve(
+                        q, retriever="llamaindex", top_k=_extract_top_k_li(self, kwargs)
+                    )
                     return items
 
                 RetrieverBase.retrieve = _patched_retrieve
@@ -404,6 +447,31 @@ def _extract_model_meta(model_obj: Any) -> dict[str, Any]:
                 out[key] = v
     except Exception:
         return out
+    # Best-effort library versions enrichment
+    try:
+        from timewarp import __version__ as _tw_version  # local import
+
+        out.setdefault("timewarp_version", _tw_version)
+    except Exception:
+        pass
+    try:  # optional deps
+        import importlib
+
+        lg = importlib.import_module("langgraph")
+        v = getattr(lg, "__version__", None)
+        if isinstance(v, str):
+            out.setdefault("langgraph_version", v)
+    except Exception:
+        pass
+    try:
+        import importlib
+
+        lcc = importlib.import_module("langchain_core")
+        v = getattr(lcc, "__version__", None)
+        if isinstance(v, str):
+            out.setdefault("langchain_core_version", v)
+    except Exception:
+        pass
     return out
 
 
@@ -658,6 +726,25 @@ def bind_memory_taps() -> Callable[[], None]:
         if RetrieverBase is not None and hasattr(RetrieverBase, "retrieve"):
             orig_ret = RetrieverBase.retrieve
 
+            def _extract_top_k_li(obj: Any, kwargs: dict[str, Any]) -> int | None:
+                try:
+                    if isinstance(kwargs.get("top_k"), int):
+                        return int(kwargs["top_k"])
+                except Exception:
+                    pass
+                try:
+                    if isinstance(kwargs.get("k"), int):
+                        return int(kwargs["k"])
+                except Exception:
+                    pass
+                try:
+                    k = getattr(obj, "k", None) or getattr(obj, "top_k", None)
+                    if isinstance(k, int):
+                        return int(k)
+                except Exception:
+                    pass
+                return None
+
             def _patched_retrieve(self: Any, *args: Any, **kwargs: Any) -> Any:
                 res = orig_ret(self, *args, **kwargs)
                 try:
@@ -682,7 +769,10 @@ def bind_memory_taps() -> Callable[[], None]:
                             "mem_provider": "LlamaIndex",
                             "query": q,
                             "items": items,
-                            "policy": {"retriever": "llamaindex"},
+                            "policy": {
+                                "retriever": "llamaindex",
+                                "top_k": _extract_top_k_li(self, kwargs),
+                            },
                         }
                     )
                 except Exception:
@@ -709,3 +799,19 @@ def bind_memory_taps() -> Callable[[], None]:
                 log_warn_once("installers.memory_taps.teardown_failed", e)
 
     return teardown
+
+
+@contextmanager
+def provider_memory_taps() -> Iterator[None]:
+    """Context manager to install provider memory/retrieval taps.
+
+    Installs best-effort patches for mem0, LangChain retrievers, and LlamaIndex; restores on exit.
+    """
+    undo = bind_memory_taps()
+    try:
+        yield None
+    finally:
+        try:
+            undo()
+        except Exception as e:
+            log_warn_once("installers.provider_memory_taps.undo_failed", e)

@@ -4,14 +4,13 @@ from collections.abc import AsyncIterable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from ...codec import to_bytes as _tw_to_bytes
-from ...determinism import now as tw_now
-from ...determinism import snapshot_rng
-from ...events import ActionType, BlobKind, BlobRef, Event, Run, hash_bytes
-from ...store import LocalStore
-from ...utils.logging import log_warn_once
-from ...version import ADAPTER_LANGGRAPH
-from ..installers import try_pop_tool_args_hash as _tw_try_pop_tool_args_hash
+from ..bindings import try_pop_tool_args_hash as _tw_try_pop_tool_args_hash
+from ..codec import to_bytes as _tw_to_bytes
+from ..determinism import now as tw_now
+from ..determinism import snapshot_rng
+from ..events import ActionType, BlobKind, BlobRef, Event, Run, hash_bytes
+from ..store import LocalStore
+from ..utils.logging import log_warn_once
 from .anchors import make_anchor_id as _tw_make_anchor_id
 from .batch import EventBatcher
 from .classify import ToolClassifier
@@ -66,6 +65,44 @@ from .stream_sync import iter_stream_sync as _tw_iter_stream_sync
 from .taps import flush_provider_taps as _tw_flush_provider_taps
 
 
+def _get_timewarp_version() -> str:
+    try:
+        from timewarp import __version__ as _tw_version
+
+        return _tw_version
+    except Exception:
+        return "0+unknown"
+
+
+def _lib_versions_meta() -> dict[str, str]:
+    """Return best-effort library version metadata for model_meta enrichment.
+
+    Includes keys when available:
+    - langgraph_version
+    - langchain_core_version
+    """
+    out: dict[str, str] = {}
+    try:
+        import importlib
+
+        lg = importlib.import_module("langgraph")
+        v = getattr(lg, "__version__", None)
+        if isinstance(v, str):
+            out["langgraph_version"] = v
+    except Exception:
+        pass
+    try:
+        import importlib
+
+        lcc = importlib.import_module("langchain_core")
+        v = getattr(lcc, "__version__", None)
+        if isinstance(v, str):
+            out["langchain_core_version"] = v
+    except Exception:
+        pass
+    return out
+
+
 def _maybe_langgraph_stream(graph: Any) -> bool:
     return hasattr(graph, "stream") and callable(graph.stream)
 
@@ -101,15 +138,18 @@ class LangGraphRecorder:
     durability: str | None = None  # e.g., "sync" | None; pass only when checkpointer present
     privacy_marks: dict[str, str] = field(default_factory=dict)
     # Batch events to reduce SQLite write overhead while preserving order
-    event_batch_size: int = 1
+    event_batch_size: int = 20
 
-    # Adapter metadata
-    ADAPTER_VERSION: str = ADAPTER_LANGGRAPH
+    # Adapter metadata (use package version for provenance; keep key compatible)
+    ADAPTER_VERSION: str = ""
 
     def __post_init__(self) -> None:
         # Install a default tool classifier if none was provided
         if self.tool_classifier is None:
             self.tool_classifier = _tw_default_tool_classifier()
+        # Normalize adapter version to package version when unset
+        if not self.ADAPTER_VERSION:
+            self.ADAPTER_VERSION = _get_timewarp_version()
         # Initialize event batcher
         if not hasattr(self, "_batcher"):
             self._batcher = EventBatcher(self.store, self.event_batch_size)
@@ -118,7 +158,7 @@ class LangGraphRecorder:
             self._mem_emitter = MemoryEmitter(
                 store=self.store,
                 run_id=self.run.run_id,
-                adapter_version=self.ADAPTER_VERSION,
+                adapter_version=(self.ADAPTER_VERSION or _get_timewarp_version()),
                 privacy_marks=self.privacy_marks,
                 memory_pruner=self.memory_pruner,
             )
@@ -378,7 +418,11 @@ class LangGraphRecorder:
             output_ref=blob,
             hashes={"state": blob.sha256_hex},
             labels=labs,
-            model_meta={"adapter_version": self.ADAPTER_VERSION, "framework": "langgraph"},
+            model_meta={
+                "adapter_version": (self.ADAPTER_VERSION or _get_timewarp_version()),
+                "timewarp_version": _get_timewarp_version(),
+                "framework": "langgraph",
+            },
             ts=tw_now(),
         )
         self._append_event(ev)
@@ -449,7 +493,11 @@ class LangGraphRecorder:
             rng_state=rng_before,
             hashes={"input": input_blob.sha256_hex},
             labels=labels,
-            model_meta={"adapter_version": self.ADAPTER_VERSION, "framework": "langgraph"},
+            model_meta={
+                "adapter_version": (self.ADAPTER_VERSION or _get_timewarp_version()),
+                "timewarp_version": _get_timewarp_version(),
+                "framework": "langgraph",
+            },
             ts=tw_now(),
         )
         self._append_event(ev)
@@ -730,7 +778,8 @@ class LangGraphRecorder:
                         hashes={"output": out_blob.sha256_hex},
                         labels=labels,
                         model_meta={
-                            "adapter_version": self.ADAPTER_VERSION,
+                            "adapter_version": (self.ADAPTER_VERSION or _get_timewarp_version()),
+                            "timewarp_version": _get_timewarp_version(),
                             "framework": "langgraph",
                         },
                         ts=tw_now(),
@@ -807,6 +856,15 @@ class LangGraphRecorder:
                 except Exception:
                     pass
 
+                mm_tool = {
+                    "adapter_version": (self.ADAPTER_VERSION or _get_timewarp_version()),
+                    "timewarp_version": _get_timewarp_version(),
+                    "framework": "langgraph",
+                }
+                try:
+                    mm_tool.update(_lib_versions_meta())
+                except Exception:
+                    pass
                 ev = Event(
                     run_id=self.run.run_id,
                     step=step,
@@ -815,7 +873,7 @@ class LangGraphRecorder:
                     input_ref=blob,
                     hashes=hashes,
                     labels=labels,
-                    model_meta={"adapter_version": self.ADAPTER_VERSION, "framework": "langgraph"},
+                    model_meta=mm_tool,
                     ts=tw_now(),
                 )
                 # Attach tool fields on the event model when available
@@ -843,9 +901,14 @@ class LangGraphRecorder:
                     llm_out_blob = None
                 # Extract common meta
                 model_meta: dict[str, Any] = {
-                    "adapter_version": self.ADAPTER_VERSION,
+                    "adapter_version": (self.ADAPTER_VERSION or _get_timewarp_version()),
+                    "timewarp_version": _get_timewarp_version(),
                     "framework": "langgraph",
                 }
+                try:
+                    model_meta.update(_lib_versions_meta())
+                except Exception:
+                    pass
                 try:
                     meta = upd.get("metadata") if isinstance(upd, dict) else None
                     if isinstance(meta, dict):
@@ -893,7 +956,8 @@ class LangGraphRecorder:
                         hashes={},
                         labels=labels,
                         model_meta={
-                            "adapter_version": self.ADAPTER_VERSION,
+                            "adapter_version": (self.ADAPTER_VERSION or _get_timewarp_version()),
+                            "timewarp_version": _get_timewarp_version(),
                             "framework": "langgraph",
                         },
                         ts=tw_now(),
@@ -945,7 +1009,8 @@ class LangGraphRecorder:
                     hashes={},
                     labels=labels,
                     model_meta={
-                        "adapter_version": self.ADAPTER_VERSION,
+                        "adapter_version": (self.ADAPTER_VERSION or _get_timewarp_version()),
+                        "timewarp_version": _get_timewarp_version(),
                         "framework": "langgraph",
                     },
                     ts=tw_now(),
@@ -994,7 +1059,8 @@ class LangGraphRecorder:
                     hashes={},
                     labels=labs2,
                     model_meta={
-                        "adapter_version": self.ADAPTER_VERSION,
+                        "adapter_version": (self.ADAPTER_VERSION or _get_timewarp_version()),
+                        "timewarp_version": _get_timewarp_version(),
                         "framework": "langgraph",
                     },
                     ts=tw_now(),
@@ -1096,7 +1162,11 @@ class LangGraphRecorder:
                 output_ref=out_blob,
                 hashes={"output": out_blob.sha256_hex},
                 labels=labels,
-                model_meta={"adapter_version": self.ADAPTER_VERSION, "framework": "langgraph"},
+                model_meta={
+                    "adapter_version": (self.ADAPTER_VERSION or _get_timewarp_version()),
+                    "timewarp_version": _get_timewarp_version(),
+                    "framework": "langgraph",
+                },
                 ts=tw_now(),
             )
             self._append_event(ev)

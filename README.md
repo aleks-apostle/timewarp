@@ -23,8 +23,8 @@ What’s Included (v0.1 core)
   - Deterministic blob layout: `runs/<run_id>/events/<step>/<kind>.bin` (zstd)
   - Connection PRAGMAs applied per-connection: `journal_mode=WAL`, `synchronous=NORMAL`, configurable busy timeout
   - Monotonic steps: per-run event `step` must strictly increase; single-writer-per-run is recommended for correctness
-- LangGraph recording adapter
-  - `timewarp.adapters.langgraph.LangGraphRecorder`: streams `updates|values|messages`, records `LLM|TOOL|DECISION|HITL|SNAPSHOT` events
+- LangGraph recording
+  - `timewarp.langgraph.LangGraphRecorder`: streams `updates|values|messages`, records `LLM|TOOL|DECISION|HITL|SNAPSHOT` events
   - Labels include `thread_id`, `namespace`, `node`, `checkpoint_id`, `anchor_id`
   - Privacy redaction via `privacy_marks`
 - Diff engine
@@ -53,7 +53,7 @@ Install from PyPI:
 ```
 pip install timewarp-llm
 # optional extras
-pip install 'timewarp-llm[adapters]'
+pip install langgraph langchain-core  # optional runtime dependencies for recording/replay
 pip install 'timewarp-llm[otel]'
 pip install 'timewarp-llm[dspy]'   # optional DSPy optimizers
 ```
@@ -66,7 +66,7 @@ pytest -q
 ```
 
 Optional dependencies
-- Adapters: `uv pip install -e .[adapters]` (installs `langgraph`, `langchain-core`)
+- LangGraph/LC core: `uv pip install langgraph langchain-core`
 - Telemetry: `uv pip install -e .[otel]` (installs `opentelemetry-*`)
 - DSPy: `uv pip install -e .[dspy]` (installs `dspy`) for optional prompt optimization
 
@@ -131,7 +131,7 @@ Manual recorder usage:
 from pathlib import Path
 from timewarp.events import Run
 from timewarp.store import LocalStore
-from timewarp.adapters.langgraph import LangGraphRecorder
+from timewarp.langgraph import LangGraphRecorder
 from timewarp import messages_pruner
 
 store = LocalStore(db_path=Path("./timewarp.db"), blobs_root=Path("./blobs"))
@@ -295,7 +295,7 @@ Capturing LangGraph memory from values
 To synthesize memory from LangGraph `values` stream, configure the recorder with `memory_paths`:
 
 ```
-from timewarp.adapters.langgraph import LangGraphRecorder
+from timewarp.langgraph import LangGraphRecorder
 
 rec = LangGraphRecorder(
     graph=graph,
@@ -314,10 +314,7 @@ Record‑time taps (determinism)
 For stronger determinism checks, Timewarp can compute and store `hashes.prompt` and `hashes.args` at call sites (LangChain core). When using installers directly, start a recording session to scope staged hashes to the current run:
 
 ```
-from timewarp.adapters.installers import (
-    begin_recording_session,
-    bind_langgraph_record,
-)
+from timewarp.bindings import begin_recording_session, bind_langgraph_record
 
 # Assuming you are using LangGraphRecorder with a concrete Run object
 end_session = begin_recording_session(run.run_id)
@@ -391,7 +388,7 @@ uv run python -m examples.langgraph_demo.run_all
 ```
 
 Notes
-- Install adapters if you haven’t already: `uv pip install -e .[adapters]` (brings `langgraph` and `langchain-core`).
+- Ensure optional deps installed: `uv pip install langgraph langchain-core`.
 - For CLI `resume`/`inject`, pass your app factory (e.g., `examples.langgraph_demo.app:make_graph` or `examples.langgraph_demo.multi_agent_full:make_graph_multi`).
 - Full multi‑agent example: `examples/langgraph_demo/multi_agent_full.py` exercises LLM, TOOL,
   DECISION, HITL, SNAPSHOT, subgraphs, parallel fan‑out with reducers, and async paths.
@@ -532,7 +529,7 @@ python - <<'PY'
 from pathlib import Path
 from timewarp.store import LocalStore
 from timewarp.events import Run
-from timewarp.adapters.langgraph import LangGraphRecorder
+from timewarp.langgraph import LangGraphRecorder
 from examples.langgraph_demo.mcp_app import make_graph_mcp
 
 store = LocalStore(db_path=Path('./timewarp.db'), blobs_root=Path('./blobs'))
@@ -569,7 +566,7 @@ Programmatic replay:
 from timewarp.replay import LangGraphReplayer
 
 replayer = LangGraphReplayer(graph=my_graph, store=store)
-from timewarp.adapters.installers import bind_langgraph_playback
+from timewarp.bindings import bind_langgraph_playback
 
 # Define an installer with the standard 3‑arg signature
 def installer(llm, tool, memory) -> None:
@@ -639,4 +636,4 @@ CLI Internals (Contributors)
   - `events`: `filter_events`.
   - `filters`: `parse_list_filters`.
 - Stability: these helper modules are implementation details for the CLI and are not part of the public API; they may change between versions.
-- Programmatic use: prefer the core modules and top‑level exports (`timewarp.events`, `timewarp.store`, `timewarp.diff`, `timewarp.replay`, `timewarp.adapters.langgraph`, etc.).
+- Programmatic use: prefer the core modules and top‑level exports (`timewarp.events`, `timewarp.store`, `timewarp.diff`, `timewarp.replay`, `timewarp.langgraph`, etc.).

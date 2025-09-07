@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from timewarp.adapters.installers import begin_recording_session, bind_langgraph_record
-from timewarp.adapters.langgraph import LangGraphRecorder
+from timewarp.bindings import begin_recording_session, bind_langgraph_record
 from timewarp.events import ActionType, Run
+from timewarp.langgraph import LangGraphRecorder
 from timewarp.store import LocalStore
 
 try:
