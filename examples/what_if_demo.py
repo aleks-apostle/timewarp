@@ -19,8 +19,8 @@ def main(run_id_str: str, step: int, replacement_json: str, thread_id: str | Non
     graph = make_graph()
     replayer = LangGraphReplayer(graph=graph, store=store)
 
-    def installer(llm, tool) -> None:
-        bind_langgraph_playback(graph, llm, tool)
+    def installer(llm, tool, memory) -> None:
+        bind_langgraph_playback(graph, llm, tool, memory)
 
     replacement = _orjson.loads(replacement_json)
     new_id = replayer.fork_with_injection(
