@@ -13,6 +13,15 @@ from .hashing import hash_prompt_ctx, hash_tools_list
 from .serialize import normalize_bytes
 
 
+def _get_timewarp_version() -> str:
+    try:
+        from timewarp import __version__ as _tw_version
+
+        return _tw_version
+    except Exception:
+        return "0+unknown"
+
+
 def finalize_messages_aggregate(
     *,
     store: LocalStore,
@@ -129,7 +138,7 @@ def finalize_messages_aggregate(
         labels=labels2,
         model_meta={
             "adapter_version": adapter_version,
-            "timewarp_version": adapter_version,
+            "timewarp_version": _get_timewarp_version(),
             "framework": "langgraph",
             "chunks_count": len(agg_chunks),
             "prompt_hash_agg_failed": True if _prompt_hash_failed else False,

@@ -322,10 +322,10 @@ def _inject_what_if(run_id: Any) -> Any:
 
     teardowns: list[Callable[[], None]] = []
 
-    def installer(llm: Any, tool: Any) -> None:
+    def installer(llm: Any, tool: Any, memory: Any) -> None:
         from timewarp.bindings import bind_langgraph_playback
 
-        td = bind_langgraph_playback(graph, llm, tool)
+        td = bind_langgraph_playback(graph, llm, tool, memory)
         teardowns.append(td)
 
     # For LLM events, a minimal replacement message is sufficient
