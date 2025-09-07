@@ -11,6 +11,7 @@ from ...adapters import installers as _installers
 from ...events import Run as _Run
 from ...replay import LangGraphReplayer
 from ...store import LocalStore
+from ...utils.logging import log_warn_once
 from ..helpers.jsonio import loads_file
 
 
@@ -250,8 +251,8 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
             for td in teardowns:
                 try:
                     td()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_warn_once("cli.inject.teardown_failed", e)
     else:
         if prompt_overrides is not None:
             print("Fork prepared with prompt overrides")

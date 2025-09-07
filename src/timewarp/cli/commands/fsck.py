@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from pathlib import Path
 from uuid import UUID
 
@@ -50,6 +51,18 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
             ref_abs.update({str(Path(args.blobs) / r) for r in repaired})
             for path_item in all_files:
                 if str(path_item) not in ref_abs:
+                    # Apply grace period to avoid racing with in-flight writes
+                    try:
+                        grace = float(getattr(args, "grace", 5))
+                    except Exception:
+                        grace = 5.0
+                    try:
+                        mtime = path_item.stat().st_mtime
+                    except Exception:
+                        mtime = 0.0
+                    if time.time() - mtime < grace:
+                        # Defer deletion within grace window
+                        continue
                     orphans.append(str(path_item.relative_to(root)))
                     try:
                         os.remove(path_item)
@@ -77,5 +90,12 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
         dest="gc_orphans",
         action="store_true",
         help="Garbage-collect orphaned blobs not referenced by the run",
+    )
+    fsp.add_argument(
+        "--grace",
+        dest="grace",
+        type=float,
+        default=5.0,
+        help="Grace period in seconds; skip deleting orphans newer than this",
     )
     fsp.set_defaults(func=_handler)

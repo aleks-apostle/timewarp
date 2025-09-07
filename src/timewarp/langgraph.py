@@ -15,6 +15,8 @@ from .adapters.langgraph import LangGraphRecorder
 from .determinism import now as tw_now
 from .events import Run
 from .store import LocalStore
+from .utils.fingerprint import runtime_labels as _tw_runtime_labels
+from .utils.logging import log_warn_once
 
 
 @dataclass
@@ -82,18 +84,18 @@ class RecorderHandle:
             if callable(end_session):
                 try:
                     end_session()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_warn_once("langgraph.session.reset_failed", e)
             if callable(teardown):
                 try:
                     teardown()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_warn_once("langgraph.teardown.record_taps_failed", e)
             if callable(teardown_mem):
                 try:
                     teardown_mem()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_warn_once("langgraph.teardown.memory_taps_failed", e)
         self.last_run_id = run.run_id
         return result
 
@@ -136,19 +138,19 @@ class RecorderHandle:
                 try:
                     # Reset session context in a thread to avoid blocking loop if needed
                     await asyncio.to_thread(end_session)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_warn_once("langgraph.async.session.reset_failed", e)
             if callable(teardown):
                 try:
                     # Teardown is currently sync best-effort; run it in a thread to avoid blocking
                     await asyncio.to_thread(teardown)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_warn_once("langgraph.async.teardown.record_taps_failed", e)
             if callable(teardown_mem):
                 try:
                     await asyncio.to_thread(teardown_mem)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_warn_once("langgraph.async.teardown.memory_taps_failed", e)
         self.last_run_id = run.run_id
         return result
 
@@ -209,12 +211,21 @@ def wrap(
         # best-effort; env parsing should never break
         pass
 
+    # Merge runtime fingerprint labels without overriding explicit caller labels
+    labels2 = dict(labels or {})
+    try:
+        fps = _tw_runtime_labels()
+        for k, v in fps.items():
+            labels2.setdefault(k, v)
+    except Exception:
+        pass
+
     return RecorderHandle(
         graph=graph,
         store=store,
         project=project,
         name=name,
-        labels=dict(labels or {}),
+        labels=labels2,
         privacy_marks=dict(privacy_marks or {}),
         durability=durability,
         stream_modes=tuple(stream_modes),

@@ -9,6 +9,7 @@ from ...determinism import now as tw_now
 from ...determinism import snapshot_rng
 from ...events import ActionType, BlobKind, BlobRef, Event, Run, hash_bytes
 from ...store import LocalStore
+from ...utils.logging import log_warn_once
 from ...version import ADAPTER_LANGGRAPH
 from ..installers import try_pop_tool_args_hash as _tw_try_pop_tool_args_hash
 from .anchors import make_anchor_id as _tw_make_anchor_id
@@ -179,8 +180,11 @@ class LangGraphRecorder:
         except Exception:
             agg = None
         if agg is not None and agg.has_pending():
-            ev2, step = agg.flush(step=step)
-            self._append_event(ev2)
+            try:
+                ev2, step = agg.flush(step=step)
+                self._append_event(ev2)
+            except Exception as e:  # pragma: no cover - defensive log
+                log_warn_once("recorder.flush_messages_failed", e)
         # Final provider-tap flush to capture any late taps
         try:
             _events, step = _tw_flush_provider_taps(
@@ -196,8 +200,8 @@ class LangGraphRecorder:
             )
             for _ev in _events:
                 self._append_event(_ev)
-        except Exception:  # pragma: no cover
-            pass
+        except Exception as e:  # pragma: no cover
+            log_warn_once("recorder.flush_provider_taps_failed", e)
 
         # Persist a terminal snapshot/state if possible
         terminal_state: Any | None = None
@@ -302,8 +306,11 @@ class LangGraphRecorder:
         except Exception:
             agg = None
         if agg is not None and agg.has_pending():
-            ev2, step = agg.flush(step=step)
-            self._append_event(ev2)
+            try:
+                ev2, step = agg.flush(step=step)
+                self._append_event(ev2)
+            except Exception as e:
+                log_warn_once("recorder.async.flush_messages_failed", e)
 
         # Terminal state + optional snapshot
         terminal_state: Any | None = None
@@ -322,8 +329,9 @@ class LangGraphRecorder:
             if callable(get_state) and config:
                 snapshot = get_state(config)
                 terminal_state = self._extract_values(snapshot)
-        except Exception:
+        except Exception as e:
             terminal_state = None
+            log_warn_once("recorder.async.get_state_failed", e)
 
         if terminal_state is not None and "terminal" in (self.snapshot_on or {"terminal"}):
             extra_labels2: dict[str, str] = {}
@@ -599,8 +607,8 @@ class LangGraphRecorder:
                     labs["thread_id"] = str(thread_id)
                 if actor and actor != "graph":
                     labs["node"] = actor
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("recorder.messages.flush_failed", e)
             return labs
 
         # Before handling non-messages updates, flush any pending aggregated messages
@@ -647,8 +655,8 @@ class LangGraphRecorder:
                         pass
                 if isinstance(meta, dict) and isinstance(meta.get("thread_id"), str):
                     thread_id = str(meta.get("thread_id"))
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("recorder.sys.put_blob_failed", e)
 
             # Identify aggregation key
             agg_key_new = (actor, namespace_label, thread_id)
@@ -685,8 +693,8 @@ class LangGraphRecorder:
                 )
                 for _ev in _events:
                     self._append_event(_ev)
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("recorder.values.put_blob_failed", e)
 
             return last_values, last_decision_key, updates_seen, step, thread_id
 
@@ -965,8 +973,9 @@ class LangGraphRecorder:
             try:
                 next_nodes = self._extract_next_nodes(state_like)
                 decision_key = ",".join(next_nodes) if isinstance(next_nodes, list) else None
-            except Exception:
+            except Exception as e:
                 decision_key = None
+                log_warn_once("recorder.values.extract_next_nodes_failed", e)
             if decision_key and decision_key != last_decision_key:
                 labs2 = _mk_labels()
                 labs2["decision"] = decision_key
@@ -975,8 +984,8 @@ class LangGraphRecorder:
                     aid = self._make_anchor_id(ActionType.DECISION, actor, labs2)
                     if aid:
                         labs2["anchor_id"] = aid
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_warn_once("recorder.values.snapshot_after_decision_failed", e)
                 evd = Event(
                     run_id=self.run.run_id,
                     step=step,
@@ -1009,8 +1018,8 @@ class LangGraphRecorder:
                 if se > 0 and (updates_seen % se) == 0:
                     self._persist_snapshot(step, state_like, labels_extra=_mk_labels())
                     step += 1
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("recorder.values.snapshot_by_cadence_failed", e)
 
             # Memory synthesis from configured value paths
             try:
@@ -1028,8 +1037,8 @@ class LangGraphRecorder:
                         )
                         for _ev3 in mem_events:
                             self._append_event(_ev3)
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("recorder.values.memory_emit_failed", e)
 
             # Retrieval detection (values-based)
             try:
@@ -1050,8 +1059,8 @@ class LangGraphRecorder:
                         if isinstance(evr, Event):
                             self._append_event(evr)
                             step = step2
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("recorder.values.retrieval_emit_failed", e)
 
             # Provider taps flush after values chunk
             try:
@@ -1068,8 +1077,8 @@ class LangGraphRecorder:
                 )
                 for _ev4 in _events:
                     self._append_event(_ev4)
-            except Exception:
-                pass
+            except Exception as e:
+                log_warn_once("recorder.values.flush_provider_taps_failed", e)
 
             return last_values, last_decision_key, updates_seen, step, thread_id
 
@@ -1093,7 +1102,7 @@ class LangGraphRecorder:
             self._append_event(ev)
             step += 1
             updates_seen += 1
-        except Exception:
-            pass
+        except Exception as e:
+            log_warn_once("recorder.fallback.put_blob_failed", e)
 
         return last_values, last_decision_key, updates_seen, step, thread_id

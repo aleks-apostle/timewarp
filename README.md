@@ -22,6 +22,7 @@ What’s Included (v0.1 core)
   - `timewarp.store.LocalStore`: SQLite (WAL) for runs/events + filesystem blobs
   - Deterministic blob layout: `runs/<run_id>/events/<step>/<kind>.bin` (zstd)
   - Connection PRAGMAs applied per-connection: `journal_mode=WAL`, `synchronous=NORMAL`, configurable busy timeout
+  - Monotonic steps: per-run event `step` must strictly increase; single-writer-per-run is recommended for correctness
 - LangGraph recording adapter
   - `timewarp.adapters.langgraph.LangGraphRecorder`: streams `updates|values|messages`, records `LLM|TOOL|DECISION|HITL|SNAPSHOT` events
   - Labels include `thread_id`, `namespace`, `node`, `checkpoint_id`, `anchor_id`
@@ -167,8 +168,9 @@ Verify that all blobs referenced by a run exist on disk; optionally repair and g
 timewarp ./timewarp.db ./blobs fsck <run_id>
 # Attempt repair by promoting any matching .tmp files to final .bin
 timewarp ./timewarp.db ./blobs fsck <run_id> --repair
-# Remove blob files on disk that are not referenced by the run (dangerous)
-timewarp ./timewarp.db ./blobs fsck <run_id> --gc-orphans
+# Remove blob files on disk that are not referenced by the run (dangerous);
+# use a grace period to avoid racing with in-flight writes
+timewarp ./timewarp.db ./blobs fsck <run_id> --gc-orphans --grace 5
 ```
 
 Output shape:
@@ -176,8 +178,26 @@ Output shape:
 ```
 {"missing": ["runs/<id>/events/12/output.bin", ...],
  "repaired": ["runs/<id>/events/12/output.bin", ...],
- "orphans_gc": ["runs/<id>/events/99/output.bin.tmp", ...]}
+"orphans_gc": ["runs/<id>/events/99/output.bin.tmp", ...]}
 ```
+
+SQLite & Concurrency
+--------------------
+
+- Single-writer-per-run: Timewarp enforces strictly increasing `step` per `run_id`.
+  The `events` table uses `(run_id, step)` as its primary key and `LocalStore` guards with a
+  monotonic check against `MAX(step)`. Running multiple writers for the same `run_id` can cause
+  UNIQUE violations or out-of-order errors. Recommended: one process per run ID.
+- PRAGMAs: Each connection applies `journal_mode=WAL`, `synchronous=NORMAL`, a configurable
+  `busy_timeout`, and best-effort `foreign_keys=ON`, `temp_store=MEMORY`, and a
+  `journal_size_limit`. These trade-offs aim for durable, fast appends.
+- JSON1 indexes (optional): Additional indexes rely on SQLite JSON1 (`json_extract`). When JSON1
+  isn’t available, index creation is skipped and a one-time warning is printed; queries still work
+  but may fall back to table scans. Most modern Python builds ship SQLite with JSON1 enabled.
+- Blob finalization: Blobs are written to `*.bin.tmp` and promoted to final `*.bin` on event
+  append. Reading a blob may also finalize the file if a matching `.tmp` exists.
+- Orphan GC: `fsck --gc-orphans` applies a grace window (`--grace`) to avoid deleting files
+  created moments ago by in-flight writers.
 
 Delta Debugging (Minimal Failing Delta)
 ---------------------------------------

@@ -294,6 +294,27 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
             except Exception as ex:  # pragma: no cover
                 print("savepatch failed:", ex)
             continue
+        if line.startswith("copypatch "):
+            parts = line.split()
+            if len(parts) < 2 or len(parts) > 3:
+                print("Usage: copypatch STEP [FILE]")
+                continue
+            try:
+                step = int(parts[1])
+            except Exception:
+                print("STEP must be an integer")
+                continue
+            out_path = Path(parts[2]) if len(parts) == 3 else Path("patches") / f"alt_{step}.json"
+            evt4: Event | None = next((e for e in rep.iter_timeline() if e.step == step), None)
+            if not evt4:
+                print("No such step")
+                continue
+            try:
+                dump_event_output_to_file(store, evt4, out_path)
+                print(f"Copied patch to {out_path}")
+            except Exception as ex:
+                print("copypatch failed:", ex)
+            continue
         if line == "snapshot":
             try:
                 ev = rep.snapshot_now()
