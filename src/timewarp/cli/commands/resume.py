@@ -66,6 +66,7 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
         args.thread_id,
         install_wrappers=installer_resume,
         freeze_time=bool(getattr(args, "freeze_time", False)),
+        no_network=bool(getattr(args, "no_network", False)),
     )
     print("Resumed run:", args.run_id)
     print("checkpoint_id=", session.checkpoint_id)
@@ -113,6 +114,12 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
         dest="freeze_time",
         action="store_true",
         help="Freeze time during replay to recorded event timestamps",
+    )
+    res.add_argument(
+        "--no-network",
+        dest="no_network",
+        action="store_true",
+        help="Block outbound network egress during replay (safety guard)",
     )
     res.add_argument(
         "--prompt-overrides",

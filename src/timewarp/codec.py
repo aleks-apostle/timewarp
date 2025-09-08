@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import os
-from typing import Any
+from typing import Any, Final
 
 import orjson
 import zstandard as zstd
@@ -35,8 +35,8 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-_ZSTD_LEVEL_DEFAULT = _env_int("TIMEWARP_ZSTD_LEVEL", 8)
-_STREAMING_THRESHOLD = _env_int("TIMEWARP_ZSTD_STREAMING_THRESHOLD", 8 << 20)  # bytes
+_ZSTD_LEVEL_DEFAULT: Final[int] = _env_int("TIMEWARP_ZSTD_LEVEL", 8)
+_STREAMING_THRESHOLD: Final[int] = _env_int("TIMEWARP_ZSTD_STREAMING_THRESHOLD", 8 << 20)  # bytes
 
 
 def zstd_compress(data: bytes, *, level: int = _ZSTD_LEVEL_DEFAULT) -> bytes:

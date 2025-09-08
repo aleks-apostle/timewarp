@@ -6,6 +6,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from .utils.logging import log_warn_once
+
 # Optional OpenTelemetry imports via importlib to keep mypy happy when not installed
 _otel_trace: Any = None
 _OtelLink: Any | None = None
@@ -119,6 +121,15 @@ def configure(
         _meter = None
         _counter_recorded = None
         _counter_replayed = None
+    # Single informational line when tracing is enabled
+    try:
+        if tp is not None:
+            prov_name = type(tp).__name__ if tp is not None else "-"
+            log_warn_once(
+                "otel.enabled", None, {"provider": prov_name, "sampling": sampling or "default"}
+            )
+    except Exception:
+        pass
     return tp
 
 
