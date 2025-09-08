@@ -10,6 +10,7 @@ from ...events import ActionType, BlobRef, Event, redact
 from ...replay import Replay, ReplayError
 from ...store import LocalStore
 from ...utils.diffing import struct_diff as _struct_diff
+from ..helpers.blobs import read_json_blob as _read_json_blob
 from ..helpers.filters import parse_list_filters
 from ..helpers.state import dump_event_output_to_file, format_state_pretty
 
@@ -27,8 +28,22 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
             av = mm.get("adapter_version")
             if isinstance(av, str):
                 adapter_versions.add(av)
-        if framework is None and e.labels:
-            framework = e.labels.get("framework")
+        if framework is None:
+            try:
+                if isinstance(mm, dict) and isinstance(mm.get("framework"), str):
+                    framework = mm.get("framework")
+            except Exception:
+                pass
+    if framework is None:
+        # Fallback to run metadata when available
+        try:
+            for r in store.list_runs():
+                if r.run_id == UUID(args.run_id):
+                    if isinstance(r.framework, str):
+                        framework = r.framework
+                    break
+        except Exception:
+            framework = None
     adapters = ",".join(sorted(adapter_versions))
     fw = framework or ""
     print(f"schema={schema_v} adapter_versions={adapters} framework={fw}")
@@ -441,18 +456,6 @@ def _plain_badge(kind: str) -> str:
         "ERROR": "[ERR]",
     }
     return symbols.get(kind, kind)
-
-
-def _read_json_blob(store: LocalStore, ref: BlobRef | None) -> object | None:
-    if ref is None:
-        return None
-    try:
-        from ...codec import from_bytes as _from_bytes
-
-        obj = _from_bytes(store.get_blob(ref))
-        return cast(object, obj)
-    except Exception:
-        return None
 
 
 def _print_last_llm(rep: Replay, store: LocalStore) -> None:

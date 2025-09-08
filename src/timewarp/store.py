@@ -305,25 +305,9 @@ class LocalStore:
         return runs
 
     def append_event(self, ev: Event) -> None:
-        # Emit an optional OTel span and persist trace/span ids into model_meta if available
-        ev_to_store = ev
+        # Emit an optional OTel span, enrich model_meta, finalize blobs, then insert
         with record_event_span(ev) as ids:
-            trace_id_hex, span_id_hex = ids
-            if trace_id_hex and span_id_hex:
-                try:
-                    meta = dict(ev.model_meta or {})
-                    meta.setdefault("otel_trace_id", trace_id_hex)
-                    meta.setdefault("otel_span_id", span_id_hex)
-                    ev_to_store = ev.model_copy(update={"model_meta": meta})
-                except Exception:
-                    ev_to_store = ev
-            # Ensure referenced blobs are finalized on disk before inserting event
-            try:
-                self._finalize_if_tmp(ev_to_store.input_ref)
-                self._finalize_if_tmp(ev_to_store.output_ref)
-            except Exception:
-                # propagate after closing span context to avoid masking tracing
-                raise
+            ev_to_store = self._prepare_event_for_insert(ev, ids)
             with self._conn() as con:
                 # Monotonic step guard per run
                 try:
@@ -390,21 +374,9 @@ class LocalStore:
                     raise
                 log_warn_once("sqlite.monotonic.guard.batch", e)
             for ev in events:
-                ev_to_store = ev
-                # Emit span and embed trace/span ids when available
+                # Emit span, enrich meta, finalize blobs, then insert
                 with record_event_span(ev) as ids:
-                    trace_id_hex, span_id_hex = ids
-                    if trace_id_hex and span_id_hex:
-                        try:
-                            meta = dict(ev.model_meta or {})
-                            meta.setdefault("otel_trace_id", trace_id_hex)
-                            meta.setdefault("otel_span_id", span_id_hex)
-                            ev_to_store = ev.model_copy(update={"model_meta": meta})
-                        except Exception:
-                            ev_to_store = ev
-                    # Ensure referenced blobs are finalized on disk before inserting event
-                    self._finalize_if_tmp(ev_to_store.input_ref)
-                    self._finalize_if_tmp(ev_to_store.output_ref)
+                    ev_to_store = self._prepare_event_for_insert(ev, ids)
                     con.execute(
                         (
                             f"INSERT INTO events ({_EVENT_COLS}) VALUES ("
@@ -632,6 +604,34 @@ class LocalStore:
         if ref is None:
             return
         self._finalize_blob_file(ref)
+
+    # --- insert preparation helpers ---
+
+    def _prepare_event_for_insert(
+        self, ev: Event, ids: tuple[str | None, str | None] | None = None
+    ) -> Event:
+        """Prepare an Event for insertion by enriching meta and finalizing blobs.
+
+        - Optionally embeds OTel trace/span ids from `ids` into `model_meta` if present.
+        - Finalizes any `.tmp` blob files referenced by input/output.
+        - Returns an updated Event; does not mutate the input instance.
+        """
+        ev_to_store = ev
+        # Enrich model_meta with otel ids when provided
+        try:
+            if ids is not None:
+                trace_id_hex, span_id_hex = ids
+                if trace_id_hex and span_id_hex:
+                    meta = dict(ev.model_meta or {})
+                    meta.setdefault("otel_trace_id", trace_id_hex)
+                    meta.setdefault("otel_span_id", span_id_hex)
+                    ev_to_store = ev.model_copy(update={"model_meta": meta})
+        except Exception:
+            ev_to_store = ev
+        # Ensure blobs are finalized before insert
+        self._finalize_if_tmp(ev_to_store.input_ref)
+        self._finalize_if_tmp(ev_to_store.output_ref)
+        return ev_to_store
 
 
 def datetime_from_iso(s: str) -> datetime:

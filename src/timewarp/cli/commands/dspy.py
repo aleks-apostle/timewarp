@@ -7,7 +7,9 @@ from uuid import UUID
 
 from ...exporters.dspy import build_dspy_dataset
 from ...store import LocalStore
+from ..helpers.imports import load_factory
 from ..helpers.jsonio import dumps_text, loads_file, print_json
+from ..helpers.prompts import load_prompt_overrides
 
 
 def _handler_build(args: argparse.Namespace, store: LocalStore) -> int:
@@ -217,88 +219,20 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     # --- fork with prompt overrides ---
     def _handler_fork(args: argparse.Namespace, store: LocalStore) -> int:
         # Load overrides spec (JSON)
-        from importlib import import_module
 
         from ...bindings import bind_langgraph_playback
         from ...events import Run as _Run
         from ...replay import LangGraphReplayer
 
         try:
-            spec = loads_file(Path(args.overrides))
-            if not isinstance(spec, dict):
-                print("Invalid overrides file: expected object mapping agent -> spec")
-                return 1
+            prompt_overrides = load_prompt_overrides(Path(args.overrides))
         except Exception as exc:
             print("Failed to read overrides:", exc)
             return 1
 
-        # Build prompt adapters from spec
-        def _build_adapter(item: Any) -> Any:
-            # Returns a Callable[[Any], Any]
-            def _identity(x: Any) -> Any:
-                return x
-
-            if isinstance(item, str):
-                text = item
-
-                def _adapter(x: Any) -> Any:
-                    if isinstance(x, list):
-                        # Prepend a system message
-                        return [{"role": "system", "content": text}, *list(x)]
-                    if isinstance(x, str):
-                        return str(x) + "\n\n" + text
-                    return x
-
-                return _adapter
-            if isinstance(item, dict):
-                mode = str(item.get("mode", "prepend_system")).lower()
-                text = str(item.get("text", ""))
-
-                def _adapter(x: Any) -> Any:
-                    if isinstance(x, list):
-                        msgs = list(x)
-                        if mode == "append_system":
-                            msgs = [*msgs, {"role": "system", "content": text}]
-                        elif mode == "replace_system":
-                            replaced = False
-                            out = []
-                            for m in msgs:
-                                if (
-                                    not replaced
-                                    and isinstance(m, dict)
-                                    and m.get("role") == "system"
-                                ):
-                                    out.append({"role": "system", "content": text})
-                                    replaced = True
-                                else:
-                                    out.append(m)
-                            msgs = (
-                                out if replaced else ([{"role": "system", "content": text}, *out])
-                            )
-                        else:  # prepend_system (default)
-                            msgs = [{"role": "system", "content": text}, *msgs]
-                        return msgs
-                    if isinstance(x, str):
-                        if mode in {"append_prompt", "append_system"}:
-                            return str(x) + "\n\n" + text
-                        elif mode == "replace_prompt":
-                            return text
-                        else:  # prepend_system / prepend_prompt
-                            return text + "\n\n" + str(x)
-                    return x
-
-                return _adapter
-            return _identity
-
-        prompt_overrides = {
-            str(agent): _build_adapter(spec_val) for agent, spec_val in spec.items()
-        }
-
         # Import app factory
         try:
-            mod_name, func_name = args.app_factory.split(":", 1)
-            mod = import_module(mod_name)
-            factory = getattr(mod, func_name)
+            factory = load_factory(args.app_factory)
             graph = factory()
         except Exception as exc:  # pragma: no cover
             print("Failed to import app factory:", exc)

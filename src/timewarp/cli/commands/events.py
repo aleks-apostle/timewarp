@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from uuid import UUID
 
+from ...events import Event
 from ...store import LocalStore
 from ..helpers.events import filter_events
 from ..helpers.jsonio import print_json
@@ -36,6 +37,22 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
         print_json(rows)
         return 0
 
+    def _compact_labels(e: Event) -> str:
+        try:
+            labels: list[str] = []
+            sm = e.labels.get("stream_mode")
+            ns = e.labels.get("namespace")
+            tid = e.labels.get("thread_id")
+            if sm:
+                labels.append(f"sm={sm}")
+            if ns:
+                labels.append(f"ns={ns}")
+            if tid:
+                labels.append(f"thr={tid}")
+            return ", ".join(labels)
+        except Exception:
+            return ""
+
     try:
         from rich.console import Console
         from rich.table import Table
@@ -47,11 +64,14 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
         table.add_column("Actor")
         table.add_column("Labels")
         for e in filtered:
-            table.add_row(str(e.step), e.action_type.value, e.actor, ", ".join(e.labels.keys()))
+            table.add_row(str(e.step), e.action_type.value, e.actor, _compact_labels(e))
         console.print(table)
     except Exception:
         for e in filtered:
-            print(f"{e.step:4d} {e.action_type.value:8s} {e.actor:10s} {e.labels}")
+            print(
+                f"{e.step:4d} {e.action_type.value:8s} {e.actor:10s} "
+                f"{_compact_labels(e) or e.labels}"
+            )
     return 0
 
 

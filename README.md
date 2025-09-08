@@ -63,6 +63,8 @@ uv venv && uv pip install -e .[dev]
 ruff format && ruff check --fix
 mypy --strict
 pytest -q
+
+Developer notes: see `docs/DEV.md` for CLI helper modules, canonical JSON path, store insert/observability details, and provenance consistency.
 ```
 
 Optional dependencies

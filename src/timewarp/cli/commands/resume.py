@@ -2,74 +2,21 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
-from importlib import import_module
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from uuid import UUID
 
 from ...bindings import bind_langgraph_playback
 from ...replay import LangGraphReplayer
 from ...store import LocalStore
-from ..helpers.jsonio import dumps_text, loads_file
-
-
-def _build_prompt_adapter(item: object) -> object:
-    # Returns a Callable[[Any], Any] built from a JSON spec (string or object)
-
-    def _identity(x: Any) -> Any:
-        return x
-
-    if isinstance(item, str):
-        text = item
-
-        def _adapter(x: Any) -> Any:
-            if isinstance(x, list):
-                return [{"role": "system", "content": text}, *list(x)]
-            if isinstance(x, str):
-                return str(x) + "\n\n" + text
-            return x
-
-        return _adapter
-    if isinstance(item, dict):
-        mode = str(item.get("mode", "prepend_system")).lower()
-        text = str(item.get("text", ""))
-
-        def _adapter(x: Any) -> Any:
-            if isinstance(x, list):
-                msgs = list(x)
-                if mode == "append_system":
-                    msgs = [*msgs, {"role": "system", "content": text}]
-                elif mode == "replace_system":
-                    replaced = False
-                    out = []
-                    for m in msgs:
-                        if not replaced and isinstance(m, dict) and m.get("role") == "system":
-                            out.append({"role": "system", "content": text})
-                            replaced = True
-                        else:
-                            out.append(m)
-                    msgs = out if replaced else ([{"role": "system", "content": text}, *out])
-                else:
-                    msgs = [{"role": "system", "content": text}, *msgs]
-                return msgs
-            if isinstance(x, str):
-                if mode in {"append_prompt", "append_system"}:
-                    return str(x) + "\n\n" + text
-                elif mode == "replace_prompt":
-                    return text
-                else:
-                    return text + "\n\n" + str(x)
-            return x
-
-        return _adapter
-    return _identity
+from ..helpers.imports import load_factory
+from ..helpers.jsonio import dumps_text
+from ..helpers.prompts import load_prompt_overrides
 
 
 def _handler(args: argparse.Namespace, store: LocalStore) -> int:
     try:
-        mod_name, func_name = args.app_factory.split(":", 1)
-        mod = import_module(mod_name)
-        factory = cast(Callable[[], Any], getattr(mod, func_name))
+        factory = load_factory(args.app_factory)
         graph = factory()
     except Exception as exc:
         print("Failed to import app factory:", exc)
@@ -86,12 +33,10 @@ def _handler(args: argparse.Namespace, store: LocalStore) -> int:
     from ...replay import PlaybackLLM, PlaybackMemory, PlaybackTool  # typing-only import
 
     # Narrow type to Callable mapping for installers signature
-    prompt_overrides: dict[str, Any] | None = None
+    prompt_overrides: dict[str, Callable[[Any], Any]] | None = None
     if getattr(args, "prompt_overrides", None):
         try:
-            obj = loads_file(Path(str(args.prompt_overrides)))
-            if isinstance(obj, dict):
-                prompt_overrides = {str(k): _build_prompt_adapter(v) for k, v in obj.items()}
+            prompt_overrides = load_prompt_overrides(Path(str(args.prompt_overrides)))
         except Exception as exc:
             print("Failed to load prompt overrides:", exc)
             return 1

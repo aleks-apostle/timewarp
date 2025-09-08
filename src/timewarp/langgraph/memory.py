@@ -10,6 +10,7 @@ from ..events import ActionType, BlobKind, Event
 from ..store import LocalStore
 from .anchors import make_anchor_id
 from .serialize import normalize_bytes
+from .versioning import get_timewarp_version as _get_timewarp_version
 
 
 def get_by_path(root: dict[str, Any], path: str) -> Any | None:
@@ -119,6 +120,7 @@ class MemoryEmitter:
                 labels=labels,
                 model_meta={
                     "adapter_version": self.adapter_version,
+                    "timewarp_version": _get_timewarp_version(),
                     "framework": "langgraph",
                     "mem_provider": "LangGraphState",
                 },

@@ -41,12 +41,22 @@ class LangGraphReplayer:
         freeze_time: bool = False,
     ) -> ReplaySession:
         events = self.store.list_events(run_id)
-        # Find initial input
+        # Find initial input: prefer step 0 SYS input when present
         inputs: Any | None = None
-        for ev in events:
-            if ev.input_ref is not None:
-                inputs = from_bytes(self.store.get_blob(ev.input_ref))
-                break
+        try:
+            step0 = next(
+                (ev for ev in events if int(ev.step) == 0 and ev.action_type is ActionType.SYS),
+                None,
+            )
+            if step0 is not None and step0.input_ref is not None:
+                inputs = from_bytes(self.store.get_blob(step0.input_ref))
+        except Exception:
+            inputs = None
+        if inputs is None:
+            for ev in events:
+                if ev.input_ref is not None:
+                    inputs = from_bytes(self.store.get_blob(ev.input_ref))
+                    break
         # Compute nearest checkpoint_id from latest SNAPSHOT <= from_step
         target = from_step if from_step is not None else 10**9
         checkpoint_id: str | None = None

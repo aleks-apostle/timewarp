@@ -116,6 +116,62 @@ def record_taps(run_id: UUID) -> Iterator[None]:
             log_warn_once("installers.record_taps.end_session_failed", e)
 
 
+# --- Generic patching helpers / small utilities ---
+
+
+def _patch_method(
+    cls: Any, name: str, make_wrapper: Callable[[Callable[..., Any]], Callable[..., Any]]
+) -> Callable[[], None] | None:
+    """Patch a method on a class and return an undo callable.
+
+    - No-ops when the attribute is missing or not callable.
+    - `make_wrapper` receives the original function and must return the patched one.
+    """
+    if cls is None or not hasattr(cls, name):
+        return None
+    orig = getattr(cls, name)
+    if not callable(orig):
+        return None
+    try:
+        patched = make_wrapper(orig)
+    except Exception as e:  # pragma: no cover - defensive
+        log_warn_once("installers.patch.make_wrapper_failed", e)
+        return None
+    setattr(cls, name, patched)
+
+    def _undo() -> None:
+        try:
+            setattr(cls, name, orig)
+        except Exception as e:  # pragma: no cover - defensive
+            log_warn_once("installers.patch.undo_failed", e)
+
+    return _undo
+
+
+def _extract_top_k_li(obj: Any, kwargs: dict[str, Any]) -> int | None:
+    """Best-effort extraction of top_k from LlamaIndex-style retrievers.
+
+    Checks kwargs (top_k/k) and object attributes (k/top_k).
+    """
+    try:
+        if isinstance(kwargs.get("top_k"), int):
+            return int(kwargs["top_k"])
+    except Exception:
+        pass
+    try:
+        if isinstance(kwargs.get("k"), int):
+            return int(kwargs["k"])
+    except Exception:
+        pass
+    try:
+        k = getattr(obj, "k", None) or getattr(obj, "top_k", None)
+        if isinstance(k, int):
+            return int(k)
+    except Exception:
+        pass
+    return None
+
+
 def bind_langgraph_playback(
     graph: Any,
     llm: PlaybackLLM,
@@ -169,35 +225,18 @@ def bind_langgraph_playback(
     except Exception:  # pragma: no cover - optional dep
         BCM = None
 
-    def _patch_invoke_on(cls: Any) -> Callable[[], None] | None:
-        if cls is None:
-            return None
-        # Guard: ensure attribute exists
-        if not hasattr(cls, "invoke"):
-            return None
-
-        orig_invoke = cls.invoke
-
+    def _make_playback_invoke_wrapper(_orig: Callable[..., Any]) -> Callable[..., Any]:
         def _patched_invoke(self: Any, prompt: Any, **kwargs: Any) -> Any:
             # Pass through observed model meta for strict validation (if enabled)
             meta = _extract_model_meta(self)
-            # Avoid clobbering if caller provided one
             if "_tw_model_meta" not in kwargs and meta:
                 kwargs["_tw_model_meta"] = meta
             return llm.invoke(prompt, **kwargs)
 
-        cls.invoke = _patched_invoke
-
-        def _undo() -> None:
-            try:
-                cls.invoke = orig_invoke
-            except Exception as e:
-                log_warn_once("installers.bind_playback.undo_invoke_failed", e)
-
-        return _undo
+        return _patched_invoke
 
     for base in (BCM, BLM):
-        undo = _patch_invoke_on(base)
+        undo = _patch_method(base, "invoke", _make_playback_invoke_wrapper)
         if undo is not None:
             teardowns.append(undo)
 
@@ -210,20 +249,16 @@ def bind_langgraph_playback(
         BaseToolCls = None
 
     if BaseToolCls is not None and callable(BaseToolCls):
-        orig_call = BaseToolCls.__call__
 
-        def _patched_call(self: Any, *args: Any, **kwargs: Any) -> Any:
-            return tool(*args, **kwargs)
+        def _make_tool_call_wrapper(_orig: Callable[..., Any]) -> Callable[..., Any]:
+            def _patched_call(self: Any, *args: Any, **kwargs: Any) -> Any:
+                return tool(*args, **kwargs)
 
-        BaseToolCls.__call__ = _patched_call
+            return _patched_call
 
-        def _undo_tool() -> None:
-            try:
-                BaseToolCls.__call__ = orig_call
-            except Exception as e:
-                log_warn_once("installers.bind_playback.undo_tool_failed", e)
-
-        teardowns.append(_undo_tool)
+        undo_tool = _patch_method(BaseToolCls, "__call__", _make_tool_call_wrapper)
+        if undo_tool is not None:
+            teardowns.append(undo_tool)
 
     # --- Optional: patch common memory providers to route to PlaybackMemory ---
     if memory is not None:
@@ -236,37 +271,26 @@ def bind_langgraph_playback(
             if cand is not None:
                 cls = cand
 
-                def _patch_mem0_method(name: str) -> Callable[[], None] | None:
-                    if not hasattr(cls, name):
-                        return None
-                    orig = getattr(cls, name)
-                    if not callable(orig):
-                        return None
-
-                    def _patched(self: Any, *args: Any, **kwargs: Any) -> Any:
-                        # Do not call the original to avoid side-effects / network
-                        if name in ("search", "retrieve", "query"):
-                            q = args[0] if args else kwargs.get("query")
-                            tk = kwargs.get("top_k")
-                            return memory.retrieve(q, retriever="mem0", top_k=tk)
-                        if name in ("save", "add", "delete", "update"):
-                            # Best-effort: no-op and return a benign value
+                def _mk_mem0_playback_wrapper(
+                    name: str,
+                ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                    def _make(_orig: Callable[..., Any]) -> Callable[..., Any]:
+                        def _patched(self: Any, *args: Any, **kwargs: Any) -> Any:
+                            # Avoid calling original to prevent side-effects / network
+                            if name in ("search", "retrieve", "query"):
+                                q = args[0] if args else kwargs.get("query")
+                                tk = kwargs.get("top_k")
+                                return memory.retrieve(q, retriever="mem0", top_k=tk)
+                            if name in ("save", "add", "delete", "update"):
+                                return None
                             return None
-                        # Fallback
-                        return None
 
-                    setattr(cls, name, _patched)
+                        return _patched
 
-                    def _undo() -> None:
-                        try:
-                            setattr(cls, name, orig)
-                        except Exception:
-                            pass
-
-                    return _undo
+                    return _make
 
                 for m in ("search", "retrieve", "query", "save", "add", "delete", "update"):
-                    undo = _patch_mem0_method(m)
+                    undo = _patch_method(cls, m, _mk_mem0_playback_wrapper(m))
                     if undo is not None:
                         teardowns.append(undo)
         except Exception as e:
@@ -277,43 +301,20 @@ def bind_langgraph_playback(
             li_mod = importlib.import_module("llama_index")
             RetrieverBase = getattr(li_mod, "BaseRetriever", None)
             if RetrieverBase is not None and hasattr(RetrieverBase, "retrieve"):
-                orig_ret = RetrieverBase.retrieve
 
-                def _extract_top_k_li(obj: Any, kwargs: dict[str, Any]) -> int | None:
-                    try:
-                        if isinstance(kwargs.get("top_k"), int):
-                            return int(kwargs["top_k"])
-                    except Exception:
-                        pass
-                    try:
-                        if isinstance(kwargs.get("k"), int):
-                            return int(kwargs["k"])
-                    except Exception:
-                        pass
-                    try:
-                        k = getattr(obj, "k", None) or getattr(obj, "top_k", None)
-                        if isinstance(k, int):
-                            return int(k)
-                    except Exception:
-                        pass
-                    return None
+                def _make_li_playback_wrapper(_orig: Callable[..., Any]) -> Callable[..., Any]:
+                    def _patched_retrieve(self: Any, *args: Any, **kwargs: Any) -> Any:
+                        q = args[0] if args else kwargs.get("query")
+                        items = memory.retrieve(
+                            q, retriever="llamaindex", top_k=_extract_top_k_li(self, kwargs)
+                        )
+                        return items
 
-                def _patched_retrieve(self: Any, *args: Any, **kwargs: Any) -> Any:
-                    q = args[0] if args else kwargs.get("query")
-                    items = memory.retrieve(
-                        q, retriever="llamaindex", top_k=_extract_top_k_li(self, kwargs)
-                    )
-                    return items
+                    return _patched_retrieve
 
-                RetrieverBase.retrieve = _patched_retrieve
-
-                def _undo_li() -> None:
-                    try:
-                        RetrieverBase.retrieve = orig_ret
-                    except Exception as e:
-                        log_warn_once("installers.llamaindex.undo_failed", e)
-
-                teardowns.append(_undo_li)
+                undo_li = _patch_method(RetrieverBase, "retrieve", _make_li_playback_wrapper)
+                if undo_li is not None:
+                    teardowns.append(undo_li)
         except Exception as e:
             log_warn_once("installers.llamaindex.patch_failed", e)
 
@@ -352,11 +353,7 @@ def bind_langgraph_record() -> Callable[[], None]:
     except Exception:  # pragma: no cover - optional
         BCM = None
 
-    def _patch_llm_on(cls: Any) -> Callable[[], None] | None:
-        if cls is None or not hasattr(cls, "invoke"):
-            return None
-        orig = cls.invoke
-
+    def _make_record_invoke_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
         def _patched(self: Any, prompt: Any, **kwargs: Any) -> Any:
             # Prefer explicit messages if provided; else hash prompt
             try:
@@ -370,18 +367,10 @@ def bind_langgraph_record() -> Callable[[], None]:
                 pass
             return orig(self, prompt, **kwargs)
 
-        cls.invoke = _patched
-
-        def _undo() -> None:
-            try:
-                cls.invoke = orig
-            except Exception as e:
-                log_warn_once("installers.bind_record.undo_invoke_failed", e)
-
-        return _undo
+        return _patched
 
     for base in (BCM, BLM):
-        undo = _patch_llm_on(base)
+        undo = _patch_method(base, "invoke", _make_record_invoke_wrapper)
         if undo is not None:
             teardowns.append(undo)
 
@@ -394,25 +383,23 @@ def bind_langgraph_record() -> Callable[[], None]:
         BaseToolCls = None
 
     if BaseToolCls is not None and callable(BaseToolCls):
-        orig_call = BaseToolCls.__call__
 
-        def _patched_call(self: Any, *args: Any, **kwargs: Any) -> Any:
-            try:
-                stage_tool_args_hash(hash_bytes(to_bytes({"args": list(args), "kwargs": kwargs})))
-            except Exception as e:
-                # best-effort; warn once for serialization failures
-                log_warn_once("installers.bind_record.stage_tool_args_failed", e)
-            return orig_call(self, *args, **kwargs)
+        def _make_tool_record_wrapper(orig: Callable[..., Any]) -> Callable[..., Any]:
+            def _patched_call(self: Any, *args: Any, **kwargs: Any) -> Any:
+                try:
+                    stage_tool_args_hash(
+                        hash_bytes(to_bytes({"args": list(args), "kwargs": kwargs}))
+                    )
+                except Exception as e:
+                    # best-effort; warn once for serialization failures
+                    log_warn_once("installers.bind_record.stage_tool_args_failed", e)
+                return orig(self, *args, **kwargs)
 
-        BaseToolCls.__call__ = _patched_call
+            return _patched_call
 
-        def _undo_tool() -> None:
-            try:
-                BaseToolCls.__call__ = orig_call
-            except Exception as e:
-                log_warn_once("installers.bind_record.undo_tool_failed", e)
-
-        teardowns.append(_undo_tool)
+        undo_tool = _patch_method(BaseToolCls, "__call__", _make_tool_record_wrapper)
+        if undo_tool is not None:
+            teardowns.append(undo_tool)
 
     def teardown() -> None:
         for f in reversed(teardowns):
@@ -541,70 +528,58 @@ def bind_memory_taps() -> Callable[[], None]:
         if cand is not None:
             cls = cand
 
-            # Wrap instance methods if present
-            def _patch_method(
-                name: str, wrapper: Callable[[Any, Any, Any], Any]
-            ) -> Callable[[], None] | None:
-                if not hasattr(cls, name):
-                    return None
-                orig = getattr(cls, name)
-                if not callable(orig):
-                    return None
+            def _mk_mem0_tap_wrapper(
+                name: str,
+            ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+                def _make(orig: Callable[..., Any]) -> Callable[..., Any]:
+                    def _patched(self: Any, *args: Any, **kwargs: Any) -> Any:
+                        res = orig(self, *args, **kwargs)
+                        try:
+                            if name in ("save", "add"):
+                                stage_memory_tap(
+                                    {
+                                        "kind": "MEMORY",
+                                        "mem_provider": "Mem0",
+                                        "mem_op": "PUT",
+                                        "key": kwargs.get("key") or "mem0",
+                                        "value": args[0] if args else kwargs.get("item"),
+                                    }
+                                )
+                            elif name in ("delete",):
+                                stage_memory_tap(
+                                    {
+                                        "kind": "MEMORY",
+                                        "mem_provider": "Mem0",
+                                        "mem_op": "DELETE",
+                                        "key": kwargs.get("key") or "mem0",
+                                        "value": None,
+                                    }
+                                )
+                            elif name in ("search", "retrieve", "query"):
+                                q = args[0] if args else kwargs.get("query")
+                                items = res if isinstance(res, list) else []
+                                stage_memory_tap(
+                                    {
+                                        "kind": "RETRIEVAL",
+                                        "mem_provider": "Mem0",
+                                        "query": q,
+                                        "items": items,
+                                        "policy": {
+                                            "retriever": "vector",
+                                            "top_k": kwargs.get("top_k"),
+                                        },
+                                    }
+                                )
+                        except Exception:
+                            pass
+                        return res
 
-                def _patched(self: Any, *args: Any, **kwargs: Any) -> Any:
-                    res = orig(self, *args, **kwargs)
-                    try:
-                        if name in ("save", "add"):
-                            stage_memory_tap(
-                                {
-                                    "kind": "MEMORY",
-                                    "mem_provider": "Mem0",
-                                    "mem_op": "PUT",
-                                    "key": kwargs.get("key") or "mem0",
-                                    "value": args[0] if args else kwargs.get("item"),
-                                }
-                            )
-                        elif name in ("delete",):
-                            stage_memory_tap(
-                                {
-                                    "kind": "MEMORY",
-                                    "mem_provider": "Mem0",
-                                    "mem_op": "DELETE",
-                                    "key": kwargs.get("key") or "mem0",
-                                    "value": None,
-                                }
-                            )
-                        elif name in ("search", "retrieve", "query"):
-                            q = args[0] if args else kwargs.get("query")
-                            items = res if isinstance(res, list) else []
-                            stage_memory_tap(
-                                {
-                                    "kind": "RETRIEVAL",
-                                    "mem_provider": "Mem0",
-                                    "query": q,
-                                    "items": items,
-                                    "policy": {
-                                        "retriever": "vector",
-                                        "top_k": kwargs.get("top_k"),
-                                    },
-                                }
-                            )
-                    except Exception:
-                        pass
-                    return res
+                    return _patched
 
-                setattr(cls, name, _patched)
-
-                def _undo() -> None:
-                    try:
-                        setattr(cls, name, orig)
-                    except Exception:
-                        pass
-
-                return _undo
+                return _make
 
             for m in ("save", "add", "delete", "search", "retrieve", "query"):
-                undo = _patch_method(m, lambda self, *a, **k: None)  # wrapper unused
+                undo = _patch_method(cls, m, _mk_mem0_tap_wrapper(m))
                 if undo is not None:
                     teardowns.append(undo)
     except Exception:
@@ -725,25 +700,6 @@ def bind_memory_taps() -> Callable[[], None]:
         RetrieverBase = getattr(li_mod, "BaseRetriever", None)
         if RetrieverBase is not None and hasattr(RetrieverBase, "retrieve"):
             orig_ret = RetrieverBase.retrieve
-
-            def _extract_top_k_li(obj: Any, kwargs: dict[str, Any]) -> int | None:
-                try:
-                    if isinstance(kwargs.get("top_k"), int):
-                        return int(kwargs["top_k"])
-                except Exception:
-                    pass
-                try:
-                    if isinstance(kwargs.get("k"), int):
-                        return int(kwargs["k"])
-                except Exception:
-                    pass
-                try:
-                    k = getattr(obj, "k", None) or getattr(obj, "top_k", None)
-                    if isinstance(k, int):
-                        return int(k)
-                except Exception:
-                    pass
-                return None
 
             def _patched_retrieve(self: Any, *args: Any, **kwargs: Any) -> Any:
                 res = orig_ret(self, *args, **kwargs)

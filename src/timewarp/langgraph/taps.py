@@ -11,6 +11,7 @@ from ..store import LocalStore
 from .anchors import make_anchor_id
 from .memory import infer_mem_scope_from_path
 from .serialize import normalize_bytes
+from .versioning import get_timewarp_version as _get_timewarp_version
 
 
 def flush_provider_taps(
@@ -77,6 +78,7 @@ def flush_provider_taps(
                     labels=labels,
                     model_meta={
                         "adapter_version": adapter_version,
+                        "timewarp_version": _get_timewarp_version(),
                         "framework": "langgraph",
                         "mem_provider": str(mem_provider),
                     },
@@ -128,6 +130,7 @@ def flush_provider_taps(
                     labels=labels2,
                     model_meta={
                         "adapter_version": adapter_version,
+                        "timewarp_version": _get_timewarp_version(),
                         "framework": "langgraph",
                         "mem_provider": str(mem_provider),
                     },

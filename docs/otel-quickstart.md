@@ -41,4 +41,4 @@ Attributes follow the `tw.*` namespace and include:
 Notes
 - Telemetry is best-effort; missing SDKs or exporter errors do not break recording.
 - Span Links are attached only when recorded spans carried OTel IDs in `model_meta`.
-
+ - Store insert refactor: `LocalStore.append_event(s)` still creates spans and embeds `trace_id`/`span_id` into `model_meta` via a shared helper.
