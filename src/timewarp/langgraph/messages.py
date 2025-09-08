@@ -51,8 +51,6 @@ def finalize_messages_aggregate(
     ctx_messages: Any | None = None
     _prompt_hash_failed = False
     try:
-        from ..codec import to_bytes as _to_bytes
-
         sources: list[Any] = []
         for ch in agg_chunks:
             meta = ch.get("metadata") if isinstance(ch, dict) else None
@@ -87,6 +85,9 @@ def finalize_messages_aggregate(
             except Exception:
                 pass
         if sources:
+            # Keep aggregated semantics by hashing the combined sources payload deterministically
+            from ..codec import to_bytes as _to_bytes
+
             prompt_hash = hash_bytes(_to_bytes({"sources": sources}))
     except Exception:
         prompt_hash = None

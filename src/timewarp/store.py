@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from uuid import UUID
 
 from .codec import zstd_compress, zstd_decompress
@@ -16,14 +16,14 @@ from .telemetry import record_event_span
 from .utils.logging import log_warn_once
 
 # Event table column order used by INSERTs/SELECTs.
-_EVENT_COLS = (
+_EVENT_COLS: Final[str] = (
     "run_id, step, action_type, actor, input_ref, output_ref, ts, rng_state, "
     "model_meta, hashes, parent_step, labels, privacy_marks, schema_version, "
     "tool_kind, tool_name, mcp_server, mcp_transport, tools_digest, mem_op, "
     "mem_scope, mem_space, mem_provider, query_id, retriever, top_k"
 )
 
-_NUM_EVENT_COLS = _EVENT_COLS.count(",") + 1
+_NUM_EVENT_COLS: Final[int] = _EVENT_COLS.count(",") + 1
 
 
 def _event_to_db_tuple(ev: Event) -> tuple[object, ...]:
@@ -233,6 +233,12 @@ class LocalStore:
         try:
             yield con
             con.commit()
+        except Exception:
+            try:
+                con.rollback()
+            except Exception as e2:
+                log_warn_once("sqlite.conn.rollback_failed", e2)
+            raise
         finally:
             con.close()
 
@@ -305,7 +311,7 @@ class LocalStore:
         return runs
 
     def append_event(self, ev: Event) -> None:
-        # Emit an optional OTel span, enrich model_meta, finalize blobs, then insert
+        # Emit an optional OTel span, enrich model_meta, then insert; finalize blobs after insert.
         with record_event_span(ev) as ids:
             ev_to_store = self._prepare_event_for_insert(ev, ids)
             with self._conn() as con:
@@ -326,14 +332,25 @@ class LocalStore:
                         raise
                     # best-effort; on failure, proceed and let PK constraint enforce
                     log_warn_once("sqlite.monotonic.guard.single", e)
-                con.execute(
-                    (
-                        f"INSERT INTO events ({_EVENT_COLS}) VALUES ("
-                        + ",".join(["?"] * _NUM_EVENT_COLS)
-                        + ")"
-                    ),
-                    _event_to_db_tuple(ev_to_store),
-                )
+                try:
+                    con.execute(
+                        (
+                            f"INSERT INTO events ({_EVENT_COLS}) VALUES ("
+                            + ",".join(["?"] * _NUM_EVENT_COLS)
+                            + ")"
+                        ),
+                        _event_to_db_tuple(ev_to_store),
+                    )
+                except sqlite3.IntegrityError as e:
+                    # Re-raise a clearer domain error for PK conflicts
+                    raise RuntimeError(
+                        f"duplicate or out-of-order step for run {ev_to_store.run_id}: "
+                        f"step={ev_to_store.step}"
+                    ) from e
+                # Finalize blobs only after a successful insert
+                # Let exceptions roll back the transaction
+                self._finalize_if_tmp(ev_to_store.input_ref)
+                self._finalize_if_tmp(ev_to_store.output_ref)
 
     def append_events(self, events: list[Event]) -> None:
         """Append multiple events in a single transaction, preserving order.
@@ -374,17 +391,26 @@ class LocalStore:
                     raise
                 log_warn_once("sqlite.monotonic.guard.batch", e)
             for ev in events:
-                # Emit span, enrich meta, finalize blobs, then insert
+                # Emit span, enrich meta, then insert; finalize blobs after insert
                 with record_event_span(ev) as ids:
                     ev_to_store = self._prepare_event_for_insert(ev, ids)
-                    con.execute(
-                        (
-                            f"INSERT INTO events ({_EVENT_COLS}) VALUES ("
-                            + ",".join(["?"] * _NUM_EVENT_COLS)
-                            + ")"
-                        ),
-                        _event_to_db_tuple(ev_to_store),
-                    )
+                    try:
+                        con.execute(
+                            (
+                                f"INSERT INTO events ({_EVENT_COLS}) VALUES ("
+                                + ",".join(["?"] * _NUM_EVENT_COLS)
+                                + ")"
+                            ),
+                            _event_to_db_tuple(ev_to_store),
+                        )
+                    except sqlite3.IntegrityError as e:
+                        raise RuntimeError(
+                            f"duplicate or out-of-order step for run {ev_to_store.run_id}: "
+                            f"step={ev_to_store.step}"
+                        ) from e
+                    # Finalize any referenced blobs post-insert
+                    self._finalize_if_tmp(ev_to_store.input_ref)
+                    self._finalize_if_tmp(ev_to_store.output_ref)
 
     def list_events(self, run_id: UUID) -> list[Event]:
         with self._conn() as con:
@@ -628,9 +654,7 @@ class LocalStore:
                     ev_to_store = ev.model_copy(update={"model_meta": meta})
         except Exception:
             ev_to_store = ev
-        # Ensure blobs are finalized before insert
-        self._finalize_if_tmp(ev_to_store.input_ref)
-        self._finalize_if_tmp(ev_to_store.output_ref)
+        # Do not finalize blobs here; defer until after a successful insert
         return ev_to_store
 
 

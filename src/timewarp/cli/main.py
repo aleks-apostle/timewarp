@@ -12,6 +12,7 @@ Handler = Callable[[argparse.Namespace, LocalStore], int]
 def _register_commands(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     # Import locally to avoid import-time side effects and optional deps.
     # Debug REPL is not yet modularized; skip if unavailable.
+    from .commands import debug as _cmd_debug
     from .commands import diff as _cmd_diff
     from .commands import dspy as _cmd_dspy
     from .commands import events as _cmd_events
@@ -33,12 +34,18 @@ def _register_commands(sub: argparse._SubParsersAction[argparse.ArgumentParser])
     _cmd_inject.register(sub)
     _cmd_memory.register(sub)
     _cmd_dspy.register(sub)
+    _cmd_debug.register(sub)
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="timewarp")
-    p.add_argument("db", help="Path to SQLite DB")
-    p.add_argument("blobs", help="Path to blobs root")
+    # Positional args are optional with sane defaults; flags override when provided
+    p.add_argument(
+        "db", nargs="?", default=None, help="Path to SQLite DB (default: timewarp.sqlite3)"
+    )
+    p.add_argument("blobs", nargs="?", default=None, help="Path to blobs root (default: ./blobs)")
+    p.add_argument("--db", dest="db_file", default=None, help="Path to SQLite DB file")
+    p.add_argument("--blobs", dest="blobs_dir", default=None, help="Path to blobs directory")
     sub = p.add_subparsers(dest="cmd", required=True)
     _register_commands(sub)
     return p
@@ -47,7 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    store = LocalStore(db_path=Path(args.db), blobs_root=Path(args.blobs))
+    db_path = Path(args.db_file or args.db or "timewarp.sqlite3")
+    blobs_root = Path(args.blobs_dir or args.blobs or "blobs")
+    store = LocalStore(db_path=db_path, blobs_root=blobs_root)
 
     func: Handler | None = getattr(args, "func", None)
     if func is None:

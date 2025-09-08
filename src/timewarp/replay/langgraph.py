@@ -39,6 +39,7 @@ class LangGraphReplayer:
         *,
         install_wrappers: Callable[[PlaybackLLM, PlaybackTool, PlaybackMemory], None] | None = None,
         freeze_time: bool = False,
+        no_network: bool = False,
     ) -> ReplaySession:
         events = self.store.list_events(run_id)
         # Find initial input: prefer step 0 SYS input when present
@@ -104,30 +105,47 @@ class LangGraphReplayer:
             cfg["configurable"]["thread_id"] = thread_id
         if checkpoint_id is not None:
             cfg["configurable"]["checkpoint_id"] = checkpoint_id
-        # Prefer .stream if available to consume values updates
-        if hasattr(self.graph, "stream") and callable(self.graph.stream):
-            iterator = cast(Iterable[Any], self.graph.stream(inputs, cfg, stream_mode=["values"]))
-            for _ in iterator:
-                pass
-            # Best-effort final state via get_state
+
+        def _run_stream_or_invoke() -> None:
+            nonlocal result
+            # Prefer .stream if available to consume values updates
+            if hasattr(self.graph, "stream") and callable(self.graph.stream):
+                iterator = cast(
+                    Iterable[Any], self.graph.stream(inputs, cfg, stream_mode=["values"])
+                )
+                for _ in iterator:
+                    pass
+                # Best-effort final state via get_state
+                try:
+                    get_state = getattr(self.graph, "get_state", None)
+                    if callable(get_state):
+                        snapshot = get_state(cfg)
+                        if isinstance(snapshot, dict) and "values" in snapshot:
+                            result = snapshot["values"]
+                        else:
+                            result = snapshot
+                except Exception:
+                    result = None
+            elif hasattr(self.graph, "invoke") and callable(self.graph.invoke):
+                result = self.graph.invoke(inputs, cfg)
+            else:
+                raise AdapterInvariant(
+                    "Graph does not support .stream or .invoke for replay. "
+                    "Ensure your app factory returns a compiled LangGraph or use the CLI `resume` "
+                    "which binds playback wrappers for you."
+                )
+
+        if no_network:
             try:
-                get_state = getattr(self.graph, "get_state", None)
-                if callable(get_state):
-                    snapshot = get_state(cfg)
-                    if isinstance(snapshot, dict) and "values" in snapshot:
-                        result = snapshot["values"]
-                    else:
-                        result = snapshot
+                from .no_network import no_network as _no_network
+
+                with _no_network():
+                    _run_stream_or_invoke()
             except Exception:
-                result = None
-        elif hasattr(self.graph, "invoke") and callable(self.graph.invoke):
-            result = self.graph.invoke(inputs, cfg)
+                # Fallback: attempt run without guard; caller should avoid egress
+                _run_stream_or_invoke()
         else:
-            raise AdapterInvariant(
-                "Graph does not support .stream or .invoke for replay. "
-                "Ensure your app factory returns a compiled LangGraph or use the CLI `resume` "
-                "which binds playback wrappers for you."
-            )
+            _run_stream_or_invoke()
         return ReplaySession(
             run_id=run_id,
             checkpoint_id=checkpoint_id,

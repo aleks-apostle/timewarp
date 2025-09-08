@@ -10,6 +10,7 @@ from ..determinism import freeze_time_at
 from ..events import ActionType, BlobKind, Event, hash_bytes
 from ..store import LocalStore
 from ..utils.hashing import hash_prompt, hash_prompt_ctx, hash_tools_list
+from ..utils.logging import log_warn_once
 from .exceptions import (
     LLMPromptMismatch,
     MissingBlob,
@@ -90,15 +91,15 @@ class PlaybackLLM:
                         kwargs["messages"] = fn(kwargs.get("messages"))
                     except Exception:
                         # Best-effort: if override fails, keep original
-                        pass
+                        log_warn_once("replay.llm.prompt_override_failed")
                 else:
                     try:
                         prompt = fn(prompt)
                     except Exception:
-                        pass
+                        log_warn_once("replay.llm.prompt_override_failed")
         except Exception:
             # Do not let override plumbing break deterministic playback
-            pass
+            log_warn_once("replay.llm.prompt_override_outer_failed")
 
         # Validate prompt hash if available on the recorded event (post-override)
         recorded_prompt_hash: str | None = None
@@ -125,7 +126,7 @@ class PlaybackLLM:
                     _stage_prompt_hash(got_hash)
                 except Exception:
                     # best-effort
-                    pass
+                    log_warn_once("replay.llm.stage_prompt_hash_failed")
         # Optional tools digest validation (best-effort)
         try:
             recorded_tools_digest: str | None = None
@@ -182,11 +183,11 @@ class PlaybackLLM:
                             # so that recorders that pop staged hashes can pick it up.
                             _stage_prompt_hash(hash_prompt(messages=msgs2, prompt=None))
                         except Exception:
-                            pass
+                            log_warn_once("replay.llm.stage_prompt_ctx_hash_failed")
         except PromptContextMismatch:
             raise
         except Exception:
-            pass
+            log_warn_once("replay.llm.prompt_ctx_validation_failed")
         # Optional model_meta validation (subset, opt-in)
         if self.strict_meta:
             try:
@@ -200,7 +201,7 @@ class PlaybackLLM:
                 raise
             except Exception:
                 # Best-effort; ignore meta errors if shapes are unexpected
-                pass
+                log_warn_once("replay.llm.model_meta_compare_failed")
 
         # One-shot override
         def _produce() -> Any:
