@@ -1,26 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from typing import Any, cast
+from typing import cast
 from uuid import UUID
 
 from ...events import ActionType, Event
 from ...store import LocalStore
+from ..helpers.blobs import read_json_blob as _read_json_blob
 from ..helpers.jsonio import print_json
-
-
-def _read_json_blob(store: LocalStore, ref: Any) -> object | None:
-    if not ref:
-        return None
-    try:
-        from typing import cast as _cast
-
-        from ...codec import from_bytes as _from_bytes
-
-        obj = _from_bytes(store.get_blob(ref))
-        return _cast(object, obj)
-    except Exception:
-        return None
 
 
 def _extract_tools_from_llm_event(

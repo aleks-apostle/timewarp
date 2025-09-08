@@ -8,16 +8,6 @@ from .events import ActionType
 from .store import LocalStore
 
 
-def _get(obj: Any, path: str) -> Any:
-    cur = obj
-    for seg in path.split("."):
-        if isinstance(cur, dict) and seg in cur:
-            cur = cur[seg]
-        else:
-            return None
-    return cur
-
-
 def rebuild_memory_snapshot(
     store: LocalStore, run_id: UUID, step: int, thread_id: str | None = None
 ) -> dict[str, Any]:

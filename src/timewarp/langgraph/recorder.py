@@ -63,44 +63,17 @@ from .stream_async import aiter_stream as _tw_aiter_stream
 from .stream_sync import build_stream_kwargs as _tw_build_stream_kwargs
 from .stream_sync import iter_stream_sync as _tw_iter_stream_sync
 from .taps import flush_provider_taps as _tw_flush_provider_taps
+from .versioning import (
+    get_timewarp_version as _get_timewarp_version,
+)
+from .versioning import (
+    lib_versions_meta as _lib_versions_meta,
+)
 
-
-def _get_timewarp_version() -> str:
-    try:
-        from timewarp import __version__ as _tw_version
-
-        return _tw_version
-    except Exception:
-        return "0+unknown"
-
-
-def _lib_versions_meta() -> dict[str, str]:
-    """Return best-effort library version metadata for model_meta enrichment.
-
-    Includes keys when available:
-    - langgraph_version
-    - langchain_core_version
-    """
-    out: dict[str, str] = {}
-    try:
-        import importlib
-
-        lg = importlib.import_module("langgraph")
-        v = getattr(lg, "__version__", None)
-        if isinstance(v, str):
-            out["langgraph_version"] = v
-    except Exception:
-        pass
-    try:
-        import importlib
-
-        lcc = importlib.import_module("langchain_core")
-        v = getattr(lcc, "__version__", None)
-        if isinstance(v, str):
-            out["langchain_core_version"] = v
-    except Exception:
-        pass
-    return out
+"""
+Version helpers moved to .versioning to avoid duplication/cycles.
+_get_timewarp_version and _lib_versions_meta are imported above.
+"""
 
 
 def _maybe_langgraph_stream(graph: Any) -> bool:

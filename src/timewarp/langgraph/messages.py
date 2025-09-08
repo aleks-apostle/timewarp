@@ -11,15 +11,7 @@ from ..store import LocalStore
 from .anchors import make_anchor_id
 from .hashing import hash_prompt_ctx, hash_tools_list
 from .serialize import normalize_bytes
-
-
-def _get_timewarp_version() -> str:
-    try:
-        from timewarp import __version__ as _tw_version
-
-        return _tw_version
-    except Exception:
-        return "0+unknown"
+from .versioning import get_timewarp_version as _get_timewarp_version
 
 
 def finalize_messages_aggregate(

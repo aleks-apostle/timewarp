@@ -60,27 +60,6 @@ def default_tool_classifier() -> ToolClassifier:
     return _cls
 
 
-def infer_actor(update: Any) -> str:
-    """Best-effort extraction of node/actor name from a LangGraph update.
-
-    Falls back to "graph" when no clear actor can be derived.
-    """
-    try:
-        if isinstance(update, dict):
-            # Common shape: {"node_name": {...}}
-            keys = list(update.keys())
-            if len(keys) == 1 and isinstance(keys[0], str):
-                return keys[0]
-            node = update.get("node") or update.get("ns")
-            if isinstance(node, str):
-                return node
-            if isinstance(node, list) and node:
-                return str(node[-1])
-    except Exception:
-        pass
-    return "graph"
-
-
 def infer_action_type(update: Any) -> ActionType:
     """Heuristic ActionType from update payload.
 
