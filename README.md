@@ -9,7 +9,7 @@ Timewarp — Deterministic Replay & Time‑Travel Debugger for LLM Agent Workflo
 
 Record every step. Rewind any step. Reproduce any run.
 
-Timewarp adds event‑sourced logging and deterministic replay to agent frameworks (LangGraph first, LangChain optional), plus a CLI debugger for step‑through, diffs, and what‑if edits. It fills a well‑documented gap: mainstream tools visualize traces but don’t let you replay them exactly.
+Timewarp adds event‑sourced logging and deterministic replay to agent frameworks (LangGraph first, LangChain optional), plus an interactive REPL debugger for step‑through, diffs, and what‑if edits. It fills a well‑documented gap: mainstream tools visualize traces but don’t let you replay them exactly.
 
 What’s Included (v0.1 core)
 ---------------------------
@@ -36,6 +36,7 @@ What’s Included (v0.1 core)
   - What‑if overrides supported (one‑shot per step)
 - CLI
   - `timewarp list|events|tools|diff|debug`, plus `resume`, `inject`, and `fsck` (see below)
+  - `timewarp-repl` interactive debugger for browsing timelines, inspecting prompts/tools/memory, deterministic resume, and recording what‑if forks
   - `export langsmith <run_id>` to serialize runs/events for external tooling
 - Telemetry (optional)
   - OpenTelemetry spans per event; replay spans link to originals via Span Links
@@ -56,6 +57,10 @@ pip install timewarp-llm
 pip install langgraph langchain-core  # optional runtime dependencies for recording/replay
 pip install 'timewarp-llm[otel]'
 pip install 'timewarp-llm[dspy]'   # optional DSPy optimizers
+
+# CLI entry points
+timewarp --help
+timewarp-repl --help
 ```
 
 ```
@@ -155,9 +160,79 @@ Debugging & Diffs
 
 ```
 timewarp ./timewarp.db ./blobs list
-timewarp ./timewarp.db ./blobs debug <run_id>
-timewarp ./timewarp.db ./blobs diff <run_a> <run_b>
+timewarp ./timewarp.db ./blobs debug <run_id>              # basic inspector (legacy)
+timewarp ./timewarp.db ./blobs diff <run_a> <run_b>       # first divergence / bisect
 timewarp ./timewarp.db ./blobs events <run_id> --type LLM --node compose --thread t-1 --json
+
+# NEW: interactive debugger (recommended)
+timewarp-repl ./timewarp.sqlite3 ./blobs <run_id> \
+  --app examples.langgraph_demo.app:make_graph \
+  --thread t-1 --freeze-time
+```
+
+Interactive Debugger (REPL)
+---------------------------
+
+Timewarp ships a richer interactive REPL that unifies timeline browsing, prompt/tools/memory
+inspection, deterministic replay, what‑if injections, prompt overrides, and diffs.
+
+- Binary: `timewarp-repl` (installed by the package)
+- Programmatic: `timewarp.interactive_debug.launch_debugger(...)`
+
+CLI usage
+
+```
+timewarp-repl <db> <blobs> <run_id> [--app module:function] [--thread ID] \
+  [--freeze-time] [--strict-meta] [--allow-diff] [--overrides overrides.json]
+```
+
+Inside the REPL
+
+```
+Commands
+  app module:function         Load a compiled LangGraph via factory (enables resume/inject)
+  thread T                    Set thread_id to use during resume/inject
+  freeze | unfreeze           Toggle freeze-time replay
+  strict | nonstrict          Toggle strict meta checks (provider/model/tools invariants)
+  allowdiff | disallowdiff    Toggle allowing prompt diffs during replay (for overrides)
+  overrides [file.json]       Load per-agent prompt overrides; empty to clear
+
+Views
+  list [type=.. node=.. thread=.. ns=..]   Timeline (filterable)
+  event STEP                  Show a single event + blob size hints
+  llm                         Show the last LLM before current position
+  prompt [STEP]               Messages/tools head + estimated tokens for an LLM step
+  tools [STEP]                Tools summary across run or details for one LLM step
+  memory                      Memory summary by space
+  memory_show STEP            Full memory snapshot up to step
+  memory_diff A B [key=path]  Structural diff between two snapshots (optional dotted key)
+
+Execution
+  resume [FROM_STEP]          Deterministically resume from a checkpoint using recorded outputs
+  inject STEP output.json [-r|--record]
+                              One-shot override at STEP; optionally record fork immediately
+  fork_prompts overrides.json [-r|--record]
+                              Prepare/record a fork that applies prompt overrides
+  diff OTHER_RUN_ID [--bisect] [--window N]
+                              Show first divergence or minimal failing window
+```
+
+Programmatic launch
+
+```
+from timewarp.interactive_debug import launch_debugger
+from examples.langgraph_demo.app import make_graph
+
+launch_debugger(
+    db="./timewarp.sqlite3",
+    blobs="./blobs",
+    run_id="<UUID>",
+    graph=make_graph(),          # or pass --app module:function via CLI
+    thread_id="t-1",
+    freeze_time=True,
+    strict_meta=False,
+    allow_diff=False,
+)
 ```
 
 Integrity Check (fsck)
@@ -275,14 +350,13 @@ timewarp ./timewarp.sqlite3 ./blobs tools <run_id> --step 42 --json
 timewarp ./timewarp.sqlite3 ./blobs memory summary <run_id> --step 120
 timewarp ./timewarp.sqlite3 ./blobs memory show <run_id> --step 120 --space planner --json
 timewarp ./timewarp.sqlite3 ./blobs memory diff <run_id> 100 140 --space planner --scope working --key messages.0
-
-# Inside the debug REPL (planned)
+Tips in the interactive REPL
 > tools            # summary across LLM steps
 > tools 42         # detail for step 42
 > prompt 42        # prompt parts (messages + tools), hashes, token estimate
 > memory           # summary by agent at current step
-> memory 120       # snapshot at step 120
-> memory diff 120 140 key=messages.0  # structural diff; optional dot path
+> memory_show 120  # snapshot at step 120
+> memory_diff 120 140 key=messages.0  # structural diff; optional dot path
 ```
 
 Details

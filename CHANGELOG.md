@@ -1,5 +1,14 @@
 ## Unreleased
 
+## 0.2.1 - 2025-09-09
+
+Enhancements
+- New interactive debugger REPL: `timewarp-repl` binary and `timewarp.interactive_debug.launch_debugger(...)` allow browsing timelines, inspecting prompts/tools/memory, deterministic resume with freeze‑time, one‑shot output injection, prompt overrides, and diffs.
+- README updated with usage examples and REPL command reference.
+
+Packaging
+- Expose `timewarp-repl` via project.scripts entrypoint; verify sdist/wheel builds cleanly.
+
 ## 0.2.0 - 2025-09-08
 
 Enhancements
