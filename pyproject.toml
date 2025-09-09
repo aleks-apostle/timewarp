@@ -1,6 +1,6 @@
 [project]
 name = "timewarp-llm"
-version = "0.2.0"
+version = "0.2.1"
 description = "Event-sourced recording + deterministic replay + time‑travel debugger for LLM agents."
 readme = "README.md"
 requires-python = ">=3.11"
